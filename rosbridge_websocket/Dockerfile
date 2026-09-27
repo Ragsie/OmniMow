@@ -1,5 +1,6 @@
 FROM ros:humble-ros-core-jammy
 
+# rosbridge needs the system loader workaround because the base image protects ldconfig.
 RUN [ -f /sbin/ldconfig ] && mv /sbin/ldconfig /sbin/ldconfig.real && ln -s /bin/true /sbin/ldconfig || true
 
 RUN apt-get update && apt-get install -y \

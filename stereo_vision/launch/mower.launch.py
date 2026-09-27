@@ -4,6 +4,8 @@ from ament_index_python.packages import get_package_share_directory
 import os
 
 def generate_launch_description():
+    """Build the robot TF and stereo nodes from the shared hardware configuration."""
+
     urdf_file = os.path.join(
         get_package_share_directory('stereo_vision'),
         'urdf',
@@ -26,7 +28,7 @@ def generate_launch_description():
     baseline = float(os.getenv('OMNIMOW_CAMERA_BASELINE', '0.06'))
     focal_length = float(os.getenv('OMNIMOW_CAMERA_FOCAL_LENGTH', '350.0'))
 
-    # DYNAMIC NAV2 PARAMETER-INJECTION FOR ASYMMETRIC CUTTER HEAD
+    # Dynamic Nav2 parameter injection for the asymmetric cutter head.
     # To prevent the asymmetric cutter head from scraping against obstacles,
     # we load the Nav2 yaml template and replace robot_radius and inflation_radius
     # with values directly from omnimow.env before running.
@@ -41,7 +43,7 @@ def generate_launch_description():
         with open(nav2_template_file, 'r') as f:
             nav2_template = f.read()
 
-        # Replace parameters
+        # Resolve placeholders using the dimensions selected for this mower.
         nav2_resolved = nav2_template.format(
             ROBOT_RADIUS=os.getenv('OMNIMOW_ROBOT_RADIUS', '0.28'),
             INFLATION_RADIUS=os.getenv('OMNIMOW_NAV2_INFLATION_RADIUS', '0.48')
@@ -52,7 +54,6 @@ def generate_launch_description():
             f.write(nav2_resolved)
         print(f"[OmniMow Launch] Dynamic Nav2 configuration saved in {resolved_nav2_file} with inflation={os.getenv('OMNIMOW_NAV2_INFLATION_RADIUS', '0.48')}m")
 
-    # Replace placeholders in the URDF template dynamically at startup [DYNAMIC TEMPLATE REPLACEMENT]
     robot_desc_formatted = robot_desc.format(
         CAMERA_OFFSET_X=camera_x,
         CAMERA_HEIGHT_Z=camera_z,

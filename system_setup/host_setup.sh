@@ -9,7 +9,7 @@ ENV_FILE="$(dirname "$0")/omnimow.env"
 if [ ! -f "$ENV_FILE" ]; then
     echo "No omnimow.env found. Creating default configuration..."
     sudo mkdir -p /etc/omnimow
-    # Copy/create file with default values
+    # Create the default hardware and deployment configuration.
     sudo tee "$ENV_FILE" > /dev/null << 'EOF'
 OMNIMOW_TRACK_WIDTH=0.40
 OMNIMOW_ROBOT_RADIUS=0.28
@@ -58,7 +58,7 @@ sudo apt-get update && sudo apt-get install -y \
 # Ensure the FastRPC daemon (cdsprpcd) is running and starts at boot for NPU access
 sudo systemctl enable --now fastrpc || true
 
-# 2.5 Create a datamapper and configure optional NFS auto-mount for the AI training server
+# 2.5 Prepare local model/statistics storage and optionally mount the AI training share.
 echo "Configuring datamapper and filesystem..."
 sudo mkdir -p /opt/omnimow/models
 sudo mkdir -p /opt/omnimow/incoming_raw
@@ -81,7 +81,7 @@ if [ -n "$OMNIMOW_NFS_SERVER_IP" ]; then
     sudo mount /opt/omnimow/incoming_raw || true
 fi
 
-# 2.6 Enable MIPI CSI device tree overlays on the Radxa board
+# 2.6 Enable the MIPI CSI device-tree overlays on the Radxa board.
 echo "Enabling MIPI CSI device tree overlays for dual IMX219 (camera) via rsetup..."
 # On Radxa OS, the 'rsetup' CLI tool is used to configure overlays automatically
 if command -v rsetup &> /dev/null; then

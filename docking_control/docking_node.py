@@ -10,6 +10,8 @@ from sensor_msgs.msg import BatteryState
 from nav2_msgs.action import NavigateToPose
 
 class OmniMowDockingController(Node):
+    """Navigate to a staging pose, then use slow motion and charging current to dock."""
+
     def __init__(self):
         super().__init__('omnimow_docking_controller')
         self.get_logger().info('OmniMow docking and charging control started.')
@@ -36,7 +38,7 @@ class OmniMowDockingController(Node):
         self.undock_srv = self.create_service(Trigger, '/omnimow/undock', self.handle_undock_request)
 
     def battery_callback(self, msg: BatteryState):
-        """Listens for BMS data from the ESP32 [cite: 5]"""
+        """Update charging state from the battery data published by the ESP32."""
         self.current_voltage = msg.voltage
         self.current_charge_amps = msg.current # Positive value indicates charging current [cite: 5]
 
@@ -45,11 +47,11 @@ class OmniMowDockingController(Node):
             self.is_charging = True
 
     def handle_dock_request(self, request, response):
-        """Triggered when the robot should find its way home and charge [cite: 19]"""
+        """Navigate home and advance slowly until charging current is detected."""
         self.get_logger().info('Docking request received. Starting 2-step docking algorithm...')
         self.is_charging = False
 
-        # === STEP 1: NAVIGATE TO THE STAGING POSE VIA NAV2 & RTK-GPS ===
+        # Step 1: use Nav2 and the fused RTK pose to reach a safe staging position.
         if not self.nav_client.wait_for_action_server(timeout_sec=5.0):
             response.success = False
             response.message = "Nav2 action server is not available. Cannot find the staging pose."
@@ -90,8 +92,7 @@ class OmniMowDockingController(Node):
 
         self.get_logger().info("Reached the staging pose successfully! Starting step 2: controlled side-docking...")
 
-        # === STEP 2: CONTROLLED SIDE-ENTRY & CHARGE DETECTION ===
-        # Subscribe to the battery status topic, which is continuously polled by the ESP32 from the Daly BMS [cite: 5]
+        # Step 2: enter the dock slowly while monitoring the Daly BMS charge current.
         self.battery_sub = self.create_subscription(
             BatteryState,
             '/battery_state',
@@ -99,7 +100,7 @@ class OmniMowDockingController(Node):
             10
         )
 
-        # We drive slowly forward and monitor the charging current
+        # The timeout converts the maximum permitted travel distance into a time limit.
         rate = self.create_rate(10) # 10 Hz
         start_time = time.time()
         timeout_duration = self.max_distance / self.dock_speed # e.g. 2.0m / 0.05m/s = 40 seconds
@@ -140,7 +141,7 @@ class OmniMowDockingController(Node):
         return response
 
     def handle_undock_request(self, request, response):
-        """Backs the robot carefully out of the charging station and prepares it for mowing [cite: 19]"""
+        """Back out of the charging station and rotate clear of the dock tower."""
         self.get_logger().info('Undocking request received. Backing out of the charging station...')
 
         rate = self.create_rate(10)

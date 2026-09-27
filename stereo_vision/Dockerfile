@@ -1,6 +1,6 @@
 FROM ros:humble-ros-base
 
-# 1. Capture the target architecture (amd64 or arm64) from Docker Buildx
+# Capture the target architecture (amd64 or arm64) from Docker Buildx.
 ARG TARGETARCH
 
 # Combine all system packages into a single layer and clean up to keep the image small and fast
@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip3 install --upgrade pip
 
-# 2. Install Python packages conditionally based on the architecture
+# Install architecture-specific acceleration packages only where supported.
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
         echo "Building for ARM64: Installing Rockchip NPU runtime..." && \
         pip3 install --no-cache-dir rknn-toolkit-lite2==2.3.2; \

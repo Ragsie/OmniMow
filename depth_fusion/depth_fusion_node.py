@@ -17,6 +17,8 @@ except ImportError:
     HAS_SNPE = False
 
 class DepthFusionNode(Node):
+    """Run image segmentation and publish a mask for Nav2 obstacle marking."""
+
     def __init__(self):
         super().__init__('depth_fusion_node')
         self.bridge = CvBridge()
@@ -66,16 +68,16 @@ class DepthFusionNode(Node):
             10
         )
 
-        #[QUALCOMM NATIVE SNPE RUNTIME INITIALISERING]
+        # Optionally initialize the native Qualcomm SNPE runtime when its bindings exist.
         if HAS_SNPE:
             try:
-                # create Qualcomm SNPE container builder
+                # Create the Qualcomm SNPE model container.
                 builder = snpe.SNPEBuilder(self.model_path)
 
                 # configure to run 100% on Hexagon HTP/DSP (NPU) for maximum performance and power saving! [cite: 7, 8]
                 builder.set_runtime_processor(snpe.Runtime.DSP)
 
-                # Build the native execution thread
+                # Build the native inference runtime.
                 self.snpe_runtime = builder.build()
                 self.get_logger().info("Qualcomm Hexagon NPU (12 TOPS) accelerated native SNPE session started!")
             except Exception as e:
@@ -91,7 +93,7 @@ class DepthFusionNode(Node):
             self.get_logger().error("Qualcomm SNPE Python SDK bindings not found! Check PYTHONPATH in your Docker container.")
             self.snpe_runtime = None
 
-        # Subscribe to the synchronized left source image
+        # Subscribe to the left camera image used as the segmentation input.
         self.subscription = self.create_subscription(
             Image,
             '/stereo/left/image_raw',
@@ -115,10 +117,10 @@ class DepthFusionNode(Node):
         # Run inference lightning-fast on Qualcomm Hexagon NPU
         outputs = self.session.run(None, {self.input_name: img_input})
 
-        # Parse and generate the segmentation mask
+        # Decode model outputs into a binary mask before restoring the source resolution.
         mask = np.zeros((model_size, model_size), dtype=np.uint8)
 
-        # Example Active Learning Logic:
+        # Active-learning hook: uncertain detections can be saved for later retraining.
         # If there are classes of interest (e.g., dog poop, toys, animals)
         # with low confidence (e.g., between 20% and 50%), save the image for nightly training.
         low_confidence_detected = False

@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
     network_mode: host
     ipc: host
-    # Updated: Gives container access to both MIPI CSI video streams
+    # Shared memory lets the stereo node exchange camera data efficiently.
     devices:
       - /dev/video0:/dev/video0
       - /dev/video1:/dev/video1
@@ -21,7 +21,7 @@ services:
     environment:
       - ROS_DOMAIN_ID=1
 
-  # ROSbridge Websocket Service (API and app communication)
+  # ROSbridge Websocket Service (API and mobile App communication)
   rosbridge_websocket:
     build:
       context: ../rosbridge_websocket
@@ -32,7 +32,7 @@ services:
     environment:
       - ROS_DOMAIN_ID=1
 
-  # Updated: Qualcomm NPU AI Inference via ONNX Runtime & QNN Execution Provider
+  # Qualcomm NPU inference service for segmentation and obstacle masking.
   depth_fusion:
     build:
       context: ../depth_fusion
@@ -41,7 +41,7 @@ services:
     restart: unless-stopped
     network_mode: host
     ipc: host
-    # Updated: Gives container full access to Qualcomm DSP/NPU FastRPC user channels
+    # Grants container full access to Qualcomm DSP/NPU FastRPC channels
     devices:
       - /dev/fastrpc-adsp:/dev/fastrpc-adsp
       - /dev/fastrpc-cdsp:/dev/fastrpc-cdsp
@@ -52,13 +52,16 @@ services:
       - /opt/omnimow/models:/models
       - /opt/omnimow/incoming_raw:/incoming_raw
       - /opt/qcom/snpe:/opt/qcom/snpe
-      - /lib/firmware:/lib/firmware:ro  # Mounts proprietary firmware blobs for Hexagon DSP
+      - /lib/firmware:/lib/firmware:ro  # Mounts proprietary firmware blobs for the Hexagon DSP
     env_file:
       - ./omnimow.env
     environment:
       - ROS_DOMAIN_ID=1
+      - SNPE_ROOT=/opt/qcom/snpe
+      - LD_LIBRARY_PATH=/opt/qcom/snpe/lib/aarch64-ubuntu-gcc9.4:/lib/firmware
+      - PYTHONPATH=/opt/qcom/snpe/lib/python
 
-  # App Backend (status overview, GPS RTK, and control broker)
+  # App Backend (Status overview, GPS RTK, and control broker)
   app_backend:
     build:
       context: ../app_backend
@@ -71,14 +74,36 @@ services:
     environment:
       - ROS_DOMAIN_ID=1
 
+  # Docking controller owns the Nav2 staging approach and final charging-contact detection.
   docking_control:
     build:
       context: ../docking_control
       dockerfile: Dockerfile
-      container_name: omnimow_docking_control
-      restart: unless-stopped
-      network_mode: host
+    container_name: omnimow_docking_control
+    restart: unless-stopped
+    network_mode: host
     env_file:
       - ./omnimow.env
     environment:
       - ROS_DOMAIN_ID=1
+
+  # FusionCore Localization Service Replaces robot_localization with advanced 23-state ECEF UKF
+  localization:
+    image: ghcr.io/manankharwar/fusioncore:latest
+    container_name: omnimow_localization
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    volumes:
+      - ./fusioncore_config.yaml:/config/robot.yaml:ro
+    env_file:
+      - ./omnimow.env
+    environment:
+      - ROS_DOMAIN_ID=1
+    command: >
+      ros2 launch fusioncore_ros fusioncore.launch.py
+      fusioncore_config:=/config/robot.yaml
+      --ros-args
+      -r /imu/data:=/imu/data_raw
+      -r /gnss/fix:=/gps/fix
+      -r /odom:=/odom

@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 
-# make sure to run without interactive prompts under installation
+# Keep package installation non-interactive during image builds.
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install basic Python environment and OpenCV
@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
     libc++-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# [QUALCOMM NATIVE SNPE ENVIRONMENT CONFIGURATION]
+# Expose the optional Qualcomm SNPE installation to the runtime and Python loader.
 ENV SNPE_ROOT=/opt/qcom/snpe
 ENV PATH="${SNPE_ROOT}/bin/x86_64-linux-clang:${PATH}"
 ENV LD_LIBRARY_PATH="${SNPE_ROOT}/lib/x86_64-linux-clang:${SNPE_ROOT}/lib:${LD_LIBRARY_PATH}"

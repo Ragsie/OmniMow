@@ -7,18 +7,30 @@
 #include <sensor_msgs/msg/battery_state.h>
 #include <std_msgs/msg/int32.h>
 #include <std_msgs/msg/float32.h>
+#include <std_msgs/msg/empty.h> // Empty message type for watchdog
 #include <driver/twai.h>
+#include <Wire.h>               // I2C for BNO085 IMU
+#include <SparkFun_BNO080_Arduino_Library.h> // SparkFun BNO085 Library
+#include <std_msgs/msg/bool.h>               // Bool message type for rain sensor
+#include <sensor_msgs/msg/imu.h>
 
 #define CAN_TX_PIN GPIO_NUM_21
 #define CAN_RX_PIN GPIO_NUM_22
 #define BUMPER_PIN 15
 #define RELAY_PIN  4
 
+// Dedicated I2C pins for the BNO085 IMU (since GPIO 21/22 are used by the CAN bus)
+#define BNO_SDA_PIN 25
+#define BNO_SCL_PIN 26
+
+// Digital rain sensor pin with internal pull-up
+#define RAIN_PIN 32
+
 // Daly BMS UART pins (Serial2 on ESP32)
 #define BMS_RX_PIN 16
 #define BMS_TX_PIN 17
 
-// Autoro VESC IDs on CAN bus
+// Autoro VESC IDs on the CAN bus (with #ifndef guards to prevent redefinition warnings from platformio.ini)
 #ifndef VESC_LEFT_ID
 #define VESC_LEFT_ID  1
 #endif
@@ -28,39 +40,54 @@
 #endif
 
 rcl_subscription_t subscriber;
-rcl_publisher_t battery_pub;                // Added: ROS 2 Battery publisher
-rcl_publisher_t state_pub;                  // Added: ROS 2 System state publisher
-rcl_publisher_t cycles_pub;                 // Added: ROS 2 Cycles publisher
-rcl_publisher_t drive_current_pub;          // Added: ROS 2 Drive current publisher
+rcl_subscription_t heartbeat_sub;           // Heartbeat receiver
+rcl_publisher_t battery_pub;                //
+rcl_publisher_t state_pub;                  //
+rcl_publisher_t cycles_pub;                 //
+rcl_publisher_t drive_current_pub;          //
+rcl_publisher_t rain_pub;                   // ROS 2 rain sensor publisher
+rcl_publisher_t imu_pub;
 geometry_msgs__msg__Twist msg_twist;
-sensor_msgs__msg__BatteryState battery_msg;  // Added: ROS 2 Battery message
-std_msgs__msg__Int32 state_msg;             // Added: ROS 2 System state message
-std_msgs__msg__Int32 cycles_msg;            // Added: ROS 2 Cycles message
-std_msgs__msg__Float32 drive_current_msg;   // Added: ROS 2 Drive current message
+std_msgs__msg__Empty heartbeat_msg;         // Heartbeat message
+sensor_msgs__msg__BatteryState battery_msg;  //
+std_msgs__msg__Int32 state_msg;             //
+std_msgs__msg__Int32 cycles_msg;            //
+std_msgs__msg__Float32 drive_current_msg;   //
+std_msgs__msg__Bool rain_msg;               // ROS 2 rain sensor message
+sensor_msgs__msg__Imu imu_msg;
 rclc_executor_t executor;
+
+// The Radxa must refresh this timestamp; otherwise the hardware relay removes motor power.
+// Watchdog variable to catch a frozen or disconnected Radxa computer
+volatile unsigned long last_heartbeat_time = 0;
+const unsigned long WATCHDOG_TIMEOUT_MS = 500;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 
 volatile bool emergency_stop = false;
-unsigned long last_bms_request = 0;         // Added: BMS polling timer
+unsigned long last_bms_request = 0;         // BMS polling timer
 const unsigned long BMS_INTERVAL = 1000;    // Request data every second
 
 int32_t expected_erpm_left = 0;
 int32_t expected_erpm_right = 0;
 bool drive_stuck = false;
+
+// BNO085 IMU instance for tilt/lift detection
+BNO080 myIMU;
+bool imu_present = false;
 unsigned long last_state_publish = 0;
 float left_current = 0.0;
 float right_current = 0.0;
 
-// Hardware Interrupt: Activated immediately on physical collision or STOP button
+// Hardware interrupt: triggers instantly on physical collision or STOP button
 void IRAM_ATTR handleBumper() {
     emergency_stop = true;
-    digitalWrite(RELAY_PIN, LOW); // Disconnect power to 40A car relay immediately!
-    twai_stop();                 // Close CAN bus to prevent any motor rotation
+    digitalWrite(RELAY_PIN, LOW); // Cut power to the 40A automotive relay immediately!
+    twai_stop();                 // Stop the CAN bus to prevent any motor rotation
 }
 
-// Initialize TWAI driver at 500 kbps
+// Initialize the TWAI driver at 500 kbps
 void init_twai() {
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
@@ -68,13 +95,13 @@ void init_twai() {
 
     if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
         twai_start();
-        Serial.println("TWAI (CAN) Driver installed and started.");
+        Serial.println("TWAI (CAN) driver installed and started.");
     } else {
-        Serial.println("Could not install TWAI driver.");
+        Serial.println("Unable to install the TWAI driver.");
     }
 }
 
-// Send ERPM command to VESC over CAN with extended frames (VESC specific protocol)
+// Send an ERPM command to the VESC over CAN using extended frames (VESC-specific protocol)
 void send_vesc_erpm(uint8_t controller_id, int32_t erpm) {
     if (emergency_stop) return;
 
@@ -91,7 +118,7 @@ void send_vesc_erpm(uint8_t controller_id, int32_t erpm) {
     twai_transmit(&message, pdMS_TO_TICKS(10));
 }
 
-// Updated: Query Daly BMS data dynamically with checksum calculation
+// Daly BMS requests use a 13-byte frame: header, command, payload, and additive checksum.
 void request_bms_data(uint8_t cmd_type) {
     uint8_t cmd[13] = {0xA5, 0x40, cmd_type, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     uint8_t checksum = 0;
@@ -102,7 +129,7 @@ void request_bms_data(uint8_t cmd_type) {
     Serial2.write(cmd, 13);
 }
 
-// Updated: Read and decode received UART packets from Daly BMS (incl. 0x90, 0x91, and 0x92)
+// Parse complete BMS frames and publish the decoded measurement on its ROS 2 topic.
 void read_bms_data() {
     if (Serial2.available() >= 13) {
         while (Serial2.available() >= 13 && Serial2.peek() != 0xA5) {
@@ -148,7 +175,16 @@ void read_bms_data() {
     }
 }
 
-// Callback function for ROS 2 Twist (/cmd_vel)
+// Heartbeat callback resets the watchdog timer
+void heartbeat_callback(const void * msvgin) {
+    last_heartbeat_time = millis();
+}
+
+// Refresh the watchdog whenever the ROS 2 heartbeat reaches the drive controller.
+void heartbeat_callback(const void * msvgin) {
+    last_heartbeat_time = millis();
+}
+
 void subscription_callback(const void * msvgin) {
     const geometry_msgs__msg__Twist * msg = (const geometry_msgs__msg__Twist *)msvgin;
 
@@ -161,6 +197,7 @@ void subscription_callback(const void * msvgin) {
         linear_x = 0.08;
     }
 
+    // TRACK_WIDTH must be defined during compilation via build_flags in platformio.ini
     double track_width = TRACK_WIDTH;
     double speed_left = linear_x - (angular_z * track_width / 2.0);
     double speed_right = linear_x + (angular_z * track_width / 2.0);
@@ -181,7 +218,7 @@ void subscription_callback(const void * msvgin) {
     }
 }
 
-// Added: Read VESC feedback, monitor wheel current, and determine if motor is stalled
+// Decode VESC status frames and publish current, rain, and state telemetry once per second.
 void read_drive_telemetry() {
     twai_message_t rx_msg;
     while (twai_receive(&rx_msg, 0) == ESP_OK) {
@@ -212,16 +249,23 @@ void read_drive_telemetry() {
     if (now - last_state_publish >= 1000) {
         last_state_publish = now;
 
-        // Publish total wheel current
+        // Read rain sensor status (active LOW when it is raining)
+        bool is_raining = (digitalRead(RAIN_PIN) == LOW);
+        rain_msg.data = is_raining;
+        rcl_publish(&rain_pub, &rain_msg, NULL);
+
+        // Publish total drive-wheel current
         drive_current_msg.data = left_current + right_current;
         rcl_publish(&drive_current_pub, &drive_current_msg, NULL);
 
         if (emergency_stop) {
-            state_msg.data = 5; // EMERGENCY STOP / BUMPER
+            state_msg.data = 5; // EMERGENCY_STOP / BUMPER
+        } else if (is_raining) {
+            state_msg.data = 8; // RAIN - makes the robot automatically return to the docking station
         } else if (drive_stuck) {
             state_msg.data = 4; // STUCK
         } else if (abs(expected_erpm_left) > 0 || abs(expected_erpm_right) > 0) {
-            state_msg.data = 1; // CUTTING / RUNNING
+            state_msg.data = 1; // MOWING / MOVING
         } else {
             state_msg.data = 0; // STOP
         }
@@ -231,7 +275,6 @@ void read_drive_telemetry() {
 
 void setup() {
     Serial.begin(115200);
-    set_microros_serial_transports(Serial);
 
     // Configure Daly BMS UART (Serial2)
     Serial2.begin(9600, SERIAL_8N1, BMS_RX_PIN, BMS_TX_PIN);
@@ -243,8 +286,23 @@ void setup() {
 
     attachInterrupt(digitalPinToInterrupt(BUMPER_PIN), handleBumper, FALLING);
 
+    // Configure rain sensor pin
+    pinMode(RAIN_PIN, INPUT_PULLUP);
+
+    // Initialize BNO085 IMU over I2C on dedicated pins
+    Wire.begin(BNO_SDA_PIN, BNO_SCL_PIN);
+    if (myIMU.begin() == false) {
+        Serial.println("Warning: BNO085 IMU not found! Check wiring on GPIO 25/26.");
+        imu_present = false;
+    } else {
+        // Enable rotation vector (Roll, Pitch, Yaw) at 50 ms polling rate (20 Hz)
+        myIMU.enableRotationVector(50);
+        Serial.println("BNO085 IMU initialized and running with stable sensor fusion!");
+        imu_present = true;
+    }
+
     init_twai();
-    
+    set_microros_serial_transports(Serial);
 
     allocator = rcl_get_default_allocator();
     rclc_support_init(&support, 0, NULL, &allocator);
@@ -285,15 +343,78 @@ void setup() {
         "/drive/current"
     );
 
-    rclc_executor_init(&executor, &support.context, 1, &allocator);
+    // Initialize rain sensor publisher
+    rclc_publisher_init_default(
+        &rain_pub,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
+        "/mower/rain"
+    );
+
+    // Reserve one executor handle for /cmd_vel and one for /mower/heartbeat.
+    rclc_executor_init(&executor, &support.context, 2, &allocator);
     rclc_executor_add_subscription(&executor, &subscriber, &msg_twist, &subscription_callback, ON_NEW_DATA);
+
+    // Initialize and add the heartbeat watchdog subscription
+    rclc_subscription_init_default(
+        &heartbeat_sub,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Empty),
+        "/mower/heartbeat"
+    );
+    rclc_executor_add_subscription(&executor, &heartbeat_sub, &heartbeat_msg, &heartbeat_callback, ON_NEW_DATA);
 }
 
 void loop() {
+    // Watchdog hardware check. If the heartbeat was previously received but is now missing for > 500 ms
+    unsigned long now_ms = millis();
+    if (!emergency_stop && last_heartbeat_time > 0 && (now_ms - last_heartbeat_time > WATCHDOG_TIMEOUT_MS)) {
+        emergency_stop = true;
+        digitalWrite(RELAY_PIN, LOW); // Immediate physical emergency stop of the 40A automotive relay!
+        twai_stop();                 // Shut down the CAN bus immediately to stop the motors
+        Serial.println("FATAL: WATCHDOG TIMEOUT! Radxa computer stopped responding. Power cut!");
+    }
+
+    // BNO085 tilt (roll) and lift monitoring for extreme physical safety
+    if (!emergency_stop && imu_present && myIMU.dataAvailable() == true) {
+        float roll = (myIMU.getRoll()) * 180.0 / PI;   // Convert Pitch/Roll radians to degrees
+        float pitch = (myIMU.getPitch()) * 180.0 / PI;
+
+        imu_msg.header.frame_id.data = (char*)"imu_link";
+        imu_msg.header.stamp.sec = millis() / 1000;
+        imu_msg.header.stamp.nanosec = (millis() % 1000) * 1000000;
+
+        imu_msg.orientation.x = myIMU.getQuatI();
+        imu_msg.orientation.y = myIMU.getQuatJ();
+        imu_msg.orientation.z = myIMU.getQuatK();
+        imu_msg.orientation.w = myIMU.getQuatReal();
+
+        // Standard high covariance if not reporting raw linear acceleration/angular velocity
+        for (int i = 0; i < 9; i++) {
+            imu_msg.orientation_covariance[i] = 0.001;
+            imu_msg.angular_velocity_covariance[i] = 0.01;
+            imu_msg.linear_acceleration_covariance[i] = 0.1;
+        }
+
+        if (!emergency_stop) {
+            rcl_publish(&imu_pub, &imu_msg, NULL);
+        }
+
+        // Safety lock: if lawnmower tilts more than 35 degrees or is lifted
+        if (!emergency_stop && (abs(roll) > 35.0 || abs(pitch) > 35.0)) {
+            emergency_stop = true;
+            digitalWrite(RELAY_PIN, LOW); // Cut power to 40A main relay immediately!
+            twai_stop();                 // Stop CAN bus to halt motor rotation
+            Serial.print("FATAL: EMERGENCY STOP! Lift/Tilt detected! ");
+            Serial.print("Roll: "); Serial.print(roll, 1);
+            Serial.print("deg | Pitch: "); Serial.print(pitch, 1); Serial.println("deg");
+        }
+    }
+
     if (!emergency_stop) {
         rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
 
-        // Updated: 3-way BMS polling rotation: 0x90 (status), 0x91 (cycles), 0x92 (temperature)
+        // Continue polling sensors and publishing telemetry while the safety lock is active.
         unsigned long now = millis();
         if (now - last_bms_request >= BMS_INTERVAL) {
             last_bms_request = now;

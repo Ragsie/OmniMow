@@ -7,6 +7,8 @@ from sensor_msgs.msg import LaserScan, Image
 from cv_bridge import CvBridge
 
 class StereoNode(Node):
+    """Convert synchronized stereo frames into a depth image and virtual LaserScan."""
+
     def __init__(self):
         super().__init__('stereo_node')
         self.publisher_scan = self.create_publisher(LaserScan, '/scan', 10)
@@ -62,7 +64,7 @@ class StereoNode(Node):
         gray_left = cv2.cvtColor(left_img, cv2.COLOR_BGR2GRAY)
         gray_right = cv2.cvtColor(right_img, cv2.COLOR_BGR2GRAY)
 
-        # Calculate stereo disparity with OpenCV StereoSGBM (Semi-Global Block Matching)
+        # StereoSGBM estimates horizontal pixel displacement between the two cameras.
         stereo = cv2.StereoSGBM_create(
             minDisparity=0,
             numDisparities=64,
@@ -80,7 +82,7 @@ class StereoNode(Node):
         disparity[disparity <= 0] = 0.1
         depth_map = (self.focal_length * self.baseline) / disparity
 
-        # Publicer det beregnede dybdebillede til visualisering/fejlfinding
+        # Publish the depth image for visualization and downstream debugging.
         depth_msg = self.bridge.cv2_to_imgmsg(depth_map, encoding="32FC1")
         depth_msg.header.stamp = self.get_clock().now().to_msg()
         depth_msg.header.frame_id = self.frame_id
@@ -158,7 +160,7 @@ class StereoNode(Node):
         # Initialize all measurements with infinite distance
         scan_ranges = np.full(num_readings, float('inf'))
 
-        # Find bin-indeks for hvert hindringspunkt
+        # Map each obstacle point to the LaserScan angle bin that contains it.
         bin_indices = ((alpha_obs - scan.angle_min) / scan.angle_increment).astype(int)
 
         # Ensure that indices stay within array bounds
@@ -166,7 +168,7 @@ class StereoNode(Node):
         bin_indices = bin_indices[valid_bins]
         R_obs = R_obs[valid_bins]
 
-        # For each angle bin, we only store the smallest distance (the closest object)
+        # Keep the closest obstacle for each angle so Nav2 receives conservative ranges.
         for idx, r in zip(bin_indices, R_obs):
             if r < scan_ranges[idx]:
                 scan_ranges[idx] = r

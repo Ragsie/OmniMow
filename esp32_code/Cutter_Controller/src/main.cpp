@@ -4,6 +4,7 @@
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 #include <std_msgs/msg/int32.h>
+#include <std_msgs/msg/empty.h> // Empty for watchdog
 #include <driver/twai.h>
 
 #define CAN_TX_PIN GPIO_NUM_21
@@ -15,22 +16,29 @@
 #include <std_msgs/msg/float32.h>
 
 rcl_subscription_t subscriber;
-rcl_publisher_t status_pub;                 // Added: ROS 2 Cutter status publisher
-rcl_publisher_t rpm_pub;                    // Added: ROS 2 Cutter RPM publisher
-rcl_publisher_t current_pub;                // Added: ROS 2 Cutter current publisher
+rcl_subscription_t heartbeat_sub;           // Heartbeat watchdog subscription
+rcl_publisher_t status_pub;                 //
+rcl_publisher_t rpm_pub;                    //
+rcl_publisher_t current_pub;                //
 std_msgs__msg__Int32 msg_speed;
-std_msgs__msg__Int32 status_msg;            // Added: ROS 2 status message
-std_msgs__msg__Int32 rpm_msg;               // Added: ROS 2 RPM message
-std_msgs__msg__Float32 current_msg;         // Added: ROS 2 current message
+std_msgs__msg__Empty heartbeat_msg;         // Heartbeat message
+std_msgs__msg__Int32 status_msg;            //
+std_msgs__msg__Int32 rpm_msg;               //
+std_msgs__msg__Float32 current_msg;         //
 rclc_executor_t executor;
+
+// The cutter is disabled when the main computer stops sending its heartbeat.
+// Cutter watchdog to detect computer failure
+volatile unsigned long last_heartbeat_time = 0;
+const unsigned long WATCHDOG_TIMEOUT_MS = 500;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 
-int32_t expected_erpm = 0;                  // Added: Expected cutter ERPM
-int32_t actual_rpm = 0;                     // Added: Actual cutter RPM
-float actual_current = 0.0;                 // Added: Actual cutter current Ampere
-bool cutter_blocked = false;                // Added: Overload / Blocked flag
+int32_t expected_erpm = 0;                  //
+int32_t actual_rpm = 0;                     //
+float actual_current = 0.0;                 //
+bool cutter_blocked = false;                // Overload / blocked flag
 unsigned long last_status_publish = 0;
 
 void init_twai() {
@@ -43,7 +51,7 @@ void init_twai() {
     }
 }
 
-// Set cutter blade revolutions (ERPM)
+// Set the cutting blade RPM (ERPM)
 void set_cutter_rpm(int32_t erpm) {
     twai_message_t message;
     message.identifier = (0x03 << 8) | VESC_CUTTER_ID; // CAN_PACKET_SET_RPM
@@ -58,7 +66,7 @@ void set_cutter_rpm(int32_t erpm) {
     twai_transmit(&message, pdMS_TO_TICKS(10));
 }
 
-// Monitoring VESC telemetry for status, RPM and current measurement
+// Read VESC status frames and publish cutter health telemetry once per second.
 void read_vesc_telemetry() {
     twai_message_t rx_msg;
     // Read CAN frames
@@ -73,15 +81,15 @@ void read_vesc_telemetry() {
                 float current = ((int16_t)((rx_msg.data[4] << 8) | rx_msg.data[5])) / 10.0;
 
                 // Store values for measurement
-                actual_rpm = rpm / 10; // VESC reports ERPM, we divide by 10 (for a 10-pole motor) to real RPM
+                actual_rpm = rpm / 10; // VESC reports ERPM; divide by 10 (for a 10-pole motor) to get real RPM
                 actual_current = current;
 
                 // BLOCKING TEST: If the blade is supposed to run (ERPM > 1000),
-                // but actual RPM is below 100 (blade is stalled/stuck)
-                // and current is very high (> 15.0A), then cutter is blocked!
+                // but the actual RPM is below 100 (blade is idle/stuck)
+                // and the current is simultaneously very high (> 15.0A), then the cutter is blocked!
                 if (expected_erpm > 1000 && abs(rpm) < 100 && current > 15.0) {
                     cutter_blocked = true;
-                    set_cutter_rpm(0); // Emergency stop of cutter immediately to protect motor and toys!
+                    set_cutter_rpm(0); // Immediate emergency stop to protect the motor and drivetrain
                     actual_rpm = 0;
                     actual_current = 0.0;
                 }
@@ -89,12 +97,12 @@ void read_vesc_telemetry() {
         }
     }
 
-    // Publish cutter status, RPM and current to ROS 2 once per second
+    // Publish cutter status, RPM, and current to ROS 2 once per second
     unsigned long now = millis();
     if (now - last_status_publish >= 1000) {
         last_status_publish = now;
 
-        // Publish status, RPM and current
+        // Publish status, RPM, and current
         status_msg.data = cutter_blocked ? 2 : (expected_erpm > 0 ? 1 : 0);
         rpm_msg.data = actual_rpm;
         current_msg.data = actual_current;
@@ -105,12 +113,17 @@ void read_vesc_telemetry() {
     }
 }
 
+// Heartbeat watchdog callback for the cutter
+void heartbeat_callback(const void * msvgin) {
+    last_heartbeat_time = millis();
+}
+
 void subscription_callback(const void * msvgin) {
     const std_msgs__msg__Int32 * msg = (const std_msgs__msg__Int32 *)msvgin;
     expected_erpm = msg->data;
 
-    // If we receive a speed command of 0 (stop cutter),
-    // we can "re-arm" the system and remove the blocking error.
+    // If we receive a speed command of 0 (stop the cutter),
+    // we can re-arm the system and clear the blocked condition.
     if (expected_erpm == 0) {
         cutter_blocked = false;
     }
@@ -118,11 +131,23 @@ void subscription_callback(const void * msvgin) {
     if (!cutter_blocked) {
         set_cutter_rpm(expected_erpm);
     } else {
-        set_cutter_rpm(0); // Remain off until system is reset by user (by sending 0)
+        set_cutter_rpm(0); // Stay off until the system is reset by the user (by sending 0)
     }
 }
 
 void setup() {
+    // Initialize the optional BNO085 safety sensor over its dedicated I2C pins.
+    Wire.begin(BNO_SDA_PIN, BNO_SCL_PIN);
+    if (myIMU.begin() == false) {
+        Serial.println("Warning: BNO085 IMU not found! Check wiring on GPIO 25/26.");
+        imu_present = false;
+    } else {
+        // Enable rotation vector (Roll, Pitch, Yaw) with 50 ms polling speed (20 Hz)
+        myIMU.enableRotationVector(50);
+        Serial.println("BNO085 IMU initialized and running with stable sensor fusion!");
+        imu_present = true;
+    }
+
     init_twai();
     set_microros_serial_transports(Serial);
 
@@ -138,7 +163,7 @@ void setup() {
         "/cutter/speed"
     );
 
-    // Initialize ROS 2 publisher on /cutter/status [Added: Publisher for cutter status]
+    // Initialize ROS 2 publisher on /cutter/status
     rclc_publisher_init_default(
         &status_pub,
         &node,
@@ -146,7 +171,7 @@ void setup() {
         "/cutter/status"
     );
 
-    // Initialize ROS 2 publisher on /cutter/rpm [Added: Publisher for cutter RPM]
+    // Initialize ROS 2 publisher on /cutter/rpm
     rclc_publisher_init_default(
         &rpm_pub,
         &node,
@@ -154,7 +179,7 @@ void setup() {
         "/cutter/rpm"
     );
 
-    // Initialize ROS 2 publisher on /cutter/current [Added: Publisher for cutter current]
+    // Initialize ROS 2 publisher on /cutter/current
     rclc_publisher_init_default(
         &current_pub,
         &node,
@@ -162,12 +187,32 @@ void setup() {
         "/cutter/current"
     );
 
-    rclc_executor_init(&executor, &support.context, 1, &allocator);
+    // Reserve one executor handle for the speed command and one for the heartbeat.
+    rclc_executor_init(&executor, &support.context, 2, &allocator);
     rclc_executor_add_subscription(&executor, &subscriber, &msg_speed, &subscription_callback, ON_NEW_DATA);
+
+    // Initialize and add the heartbeat watchdog subscription for the cutter
+    rclc_subscription_init_default(
+        &heartbeat_sub,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Empty),
+        "/mower/heartbeat"
+    );
+    rclc_executor_add_subscription(&executor, &heartbeat_sub, &heartbeat_msg, &heartbeat_callback, ON_NEW_DATA);
 }
 
 void loop() {
+    // Watchdog check. If the computer freezes, the blade is immediately switched off!
+    unsigned long now_ms = millis();
+    if (last_heartbeat_time > 0 && (now_ms - last_heartbeat_time > WATCHDOG_TIMEOUT_MS)) {
+        expected_erpm = 0;
+        set_cutter_rpm(0); // Switch blade off immediately!
+        actual_rpm = 0;
+        actual_current = 0.0;
+        Serial.println("FATAL: CUTTER WATCHDOG TIMEOUT! Stopped cutting blade immediately!");
+    }
+
     rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
-    read_vesc_telemetry(); // Added: Polling of VESC CAN status messages
+    read_vesc_telemetry(); //
     delay(10);
 }
