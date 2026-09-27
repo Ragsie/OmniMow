@@ -71,10 +71,3 @@ Although the hardware architecture uses off-the-shelf components, I would like t
 If this project helped you or inspired your own build, consider buying me a cup of coffee. It would mean a lot and would support me in developing more.
 
 Please note that this project is, and will always remain, **100% free and open-source** under the **GNU GPLv3 License**, in accordance with the licenses of our upstream dependencies.
-
-[![Buy Me A Coffee](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=ragsie&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff)](https://buymeacoffee.com/ragsie)
-
-| Coin | QR | Address |
-| :-- | :--- | :---: |
-| **Bitcoin Cash** | <img width="160" height="161" alt="qrcode" src="https://github.com/user-attachments/assets/254aece9-8957-4d34-812c-885ac2e839fa" /> | `bitcoincash:qzp4c7klef8q6gxycvc84dx0fnhnfxkkpy6xda56h3` |
-| **Bitcoin** | <img width="160" height="162" alt="image" src="https://github.com/user-attachments/assets/e5b1cd3d-fd26-46fc-88db-2aa931b4f5d4" /> | `3QrAPVGC3aypf3LG5DYYRnjwjKuFMzkeJE` |
