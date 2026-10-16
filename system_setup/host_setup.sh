@@ -220,7 +220,7 @@ SUBSYSTEMS=="usb", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{seri
 SUBSYSTEMS=="usb", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="CHANGE_ME_CUTTER", SYMLINK+="ttyUSB_esp32_cutter", MODE="0666"
 EOF
 fi
-udevadm control --reload-rules && udevadm trigger || true
+{ udevadm control --reload-rules && udevadm trigger; } || true
 
 # ModemManager probes new serial ports and gets in the way of the ESP32s
 systemctl disable --now ModemManager.service 2>/dev/null || true
