@@ -1,0 +1,29 @@
+libcamera software ISP: GPU debayer statistics over the whole frame
+
+The GPU debayer (DebayerEGL) scales the whole input frame to the output size,
+and process() hands the whole input buffer to the statistics. configure()
+still set the statistics window to the output size from the origin, so with
+1640x1232 in and 640x480 out, exposure and white balance only looked at the
+top-left 39 % of the picture (sky and background for the mower). The window
+is now the whole input frame.
+
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 4d0caa6..2963382 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -341,10 +341,12 @@ int DebayerEGL::configure(const StreamConfiguration &inputCfg,
+ 	window_.height = outputCfg.size.height;
+ 
+ 	/*
+-	 * Don't pass x,y from window_ since process() already adjusts for it.
+-	 * But crop the window to 2/3 of its width and height for speedup.
++	 * The shader scales the whole input frame to the output size, and
++	 * process() passes the whole input buffer to the statistics: gather
++	 * them over the whole frame. The output-sized window from the origin
++	 * only covered the top-left corner when scaling down.
+ 	 */
+-	stats_->setWindow(Rectangle(window_.size()));
++	stats_->setWindow(Rectangle(inputCfg.size));
+ 
+ 	return 0;
+ }

@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * OmniMow stereo camera: two IMX219 sensors on CAM2 and CAM3 of the Radxa Dragon Q6A.
+ *
+ * Radxa's two overlays in one, from https://github.com/radxa-pkg/radxa-overlays
+ * (Copyright (c) 2025 Radxa Computer (Shenzhen) Co., Ltd., BSD-3-Clause):
+ *   qcs6490-radxa-dragon-q6a-cam2-radxa-camera-8m-219.dtso  (CAM2: CCI1 bus 0, CSIPHY2)
+ *   qcs6490-radxa-dragon-q6a-cam3-radxa-camera-8m-219.dtso  (CAM3: CCI1 bus 1, CSIPHY3)
+ *
+ * The board's device tree has no __symbols__, so this is not applied as an overlay: it is
+ * appended to the decompiled board .dtb with node paths instead of labels (@TLMM@ etc. are
+ * filled in by install_camera_dtb.sh) and compiled into a new .dtb. GPIO_ACTIVE_HIGH = 0.
+ *
+ * libcamera IDs: CAM3 = /base/soc@0/cci@ac4b000/i2c-bus@1/camera@10 (left in omnimow.env),
+ *                CAM2 = /base/soc@0/cci@ac4b000/i2c-bus@0/camera@10 (right).
+ */
+
+&{/} {
+	ext_cam_clk_imx219: ext-cam-clk-imx219 {
+		status = "okay";
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "ext_cam_clk_imx219";
+		#clock-cells = <0>;
+	};
+
+	ext_cam_clk_imx219_1: ext-cam-clk-imx219-1 {
+		status = "okay";
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "ext_cam_clk_imx219_1";
+		#clock-cells = <0>;
+	};
+
+	camera-pwdn-gpio-0 {
+		status = "okay";
+		compatible = "regulator-fixed";
+		regulator-name = "camera_pwdn_gpio_0";
+		regulator-always-on;
+		enable-active-high;
+		gpios = <&{@TLMM@} 77 0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_pwdn_gpio_0>;
+	};
+
+	camera-pwdn-gpio-1 {
+		status = "okay";
+		compatible = "regulator-fixed";
+		regulator-name = "camera_pwdn_gpio_1";
+		regulator-always-on;
+		enable-active-high;
+		gpios = <&{@TLMM@} 78 0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_pwdn_gpio_1>;
+	};
+};
+
+&{/reserved-memory} {
+	linux,cma {
+		compatible = "shared-dma-pool";
+		size = <0x0 0x8000000>;
+		reusable;
+		linux,cma-default;
+	};
+};
+
+&{@CAMSS@} {
+	vdda-phy-supply = <&{@VREG_L10C@}>;
+	vdda-pll-supply = <&{@VREG_L6B@}>;
+
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* The port index denotes the CSIPHY id */
+		port@2 {
+			reg = <2>;
+
+			csiphy2_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1>;
+				remote-endpoint = <&imx219_0_ep>;
+			};
+		};
+
+		port@3 {
+			reg = <3>;
+
+			csiphy3_ep: endpoint {
+				clock-lanes = <7>;
+				data-lanes = <0 1>;
+				remote-endpoint = <&imx219_1_ep>;
+			};
+		};
+	};
+};
+
+&{@CCI1@} {
+	status = "okay";
+};
+
+/* CAM2 */
+&{@CCI1@/i2c-bus@0} {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	camera@10 {
+		compatible = "sony,imx219";
+		reg = <0x10>;
+		clocks = <&ext_cam_clk_imx219>;
+		clock-names = "ext_cam_clk_imx219";
+
+		port {
+			imx219_0_ep: endpoint {
+				link-frequencies = /bits/ 64 <456000000>;
+				data-lanes = <1 2>;
+				remote-endpoint = <&csiphy2_ep>;
+			};
+		};
+	};
+};
+
+/* CAM3 */
+&{@CCI1@/i2c-bus@1} {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	camera@10 {
+		compatible = "sony,imx219";
+		reg = <0x10>;
+		clocks = <&ext_cam_clk_imx219_1>;
+		clock-names = "ext_cam_clk_imx219_1";
+
+		port {
+			imx219_1_ep: endpoint {
+				link-frequencies = /bits/ 64 <456000000>;
+				data-lanes = <1 2>;
+				remote-endpoint = <&csiphy3_ep>;
+			};
+		};
+	};
+};
+
+&{@TLMM@} {
+	cam_pwdn_gpio_0: cam-pwdn-gpio-0-state {
+		pins = "gpio77";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	cam_pwdn_gpio_1: cam-pwdn-gpio-1-state {
+		pins = "gpio78";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+};

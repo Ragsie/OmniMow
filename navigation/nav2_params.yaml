@@ -1,0 +1,299 @@
+# ==============================================================================
+# OmniMow Nav2 configuration - ROS 2 Jazzy (Ubuntu 24.04)
+# Radxa Dragon Q6A (QCS6490) + stereo virtual LiDAR (/scan) + AI obstacles (/vision/obstacle_points)
+#
+# Localization without GPS: FusionCore (IMU + wheels + visual odometry) publishes odom -> base_link,
+# RTAB-Map corrects the drift with loop closures and publishes map -> odom.
+# Global planning runs in "map", the local costmap/controller in "odom".
+# {FOOTPRINT} and {INFLATION_RADIUS} are filled in from omnimow.env by navigation.launch.py.
+# AI sources: /vision/obstacle_points (dogs, poo, toys, ...) and /vision/boundary_points (lawn edge).
+# ==============================================================================
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: False
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /fusion/odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+
+controller_server:
+  ros__parameters:
+    use_sim_time: False
+    odom_topic: /fusion/odom
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.5
+      movement_time_allowance: 10.0
+
+    # Goal checker (matched to visual SLAM accuracy)
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.15  # 15 cm tolerance
+      yaw_goal_tolerance: 0.08 # Approx. 4.5 degree angular tolerance
+
+    # RPP-controlled speed and steering parameters for the asymmetric Worx chassis:
+    # reduced max linear speed for higher precision near obstacles.
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.38
+      lookahead_dist: 0.5
+      min_lookahead_dist: 0.25
+      max_lookahead_dist: 0.8
+      lookahead_time: 1.5
+      rotate_to_heading_angular_vel: 0.30
+      transform_tolerance: 0.1
+      use_velocity_scaled_lookahead_dist: True
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.6
+      use_collision_detection: True
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      use_regulated_linear_velocity_scaling: True
+      regulated_linear_scaling_min_radius: 0.8
+      regulated_linear_scaling_min_speed: 0.12 # Reduced speed during sharp turns to avoid skidding
+      use_cost_regulated_linear_velocity_scaling: True
+      cost_scaling_dist: 0.5
+      cost_scaling_gain: 1.0
+      inflation_cost_scaling_factor: 4.0
+      use_rotate_to_heading: True
+      rotate_to_heading_min_angle: 0.785
+      max_angular_accel: 1.0
+      allow_reversing: False
+      max_robot_pose_search_dist: 10.0
+
+planner_server:
+  ros__parameters:
+    use_sim_time: False
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      tolerance: 0.1
+      use_astar: True       # A* instead of Dijkstra for lower CPU load
+      allow_unknown: True   # No map: plan through space the cameras have not seen yet
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: False
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors::Wait"
+    local_frame: odom
+    global_frame: map
+    robot_base_frame: base_link
+    transform_tolerance: 0.1
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 0.3
+    min_rotational_vel: 0.1
+    rotational_acc_lim: 1.0
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: False
+    smoothing_frequency: 20.0
+    scale_velocities: False
+    feedback: "OPEN_LOOP"
+    odom_topic: /fusion/odom
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+    max_velocity: [0.45, 0.0, 0.6]
+    min_velocity: [-0.15, 0.0, -0.6]
+    max_accel: [0.4, 0.0, 1.0]
+    max_decel: [-0.6, 0.0, -1.0]
+
+# Collision monitor sits between Nav2 and /cmd_vel and stops/slows the mower on its own,
+# independent of planning, when the cameras see something right in front of it.
+collision_monitor:
+  ros__parameters:
+    use_sim_time: False
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel_smoothed"
+    cmd_vel_out_topic: "cmd_vel"
+    state_topic: "collision_monitor_state"
+    transform_tolerance: 0.2
+    source_timeout: 1.0
+    base_shift_correction: True
+    stop_pub_timeout: 2.0
+    polygons: ["PolygonStop", "PolygonSlow"]
+    # The camera only sees from ~0.4 m in front of base_link, so the zones start there
+    PolygonStop:
+      type: "polygon"
+      points: "[[0.60, 0.30], [0.60, -0.30], [0.30, -0.30], [0.30, 0.30]]"
+      action_type: "stop"
+      min_points: 4
+      visualize: True
+      polygon_pub_topic: "polygon_stop"
+      enabled: True
+    PolygonSlow:
+      type: "polygon"
+      points: "[[1.00, 0.40], [1.00, -0.40], [0.30, -0.40], [0.30, 0.40]]"
+      action_type: "slowdown"
+      min_points: 4
+      slowdown_ratio: 0.3
+      visualize: True
+      polygon_pub_topic: "polygon_slowdown"
+      enabled: True
+    observation_sources: ["scan", "ai_obstacles"]
+    scan:
+      type: "scan"
+      topic: "/scan"
+      enabled: True
+    ai_obstacles:
+      type: "pointcloud"
+      topic: "/vision/obstacle_points"
+      min_height: 0.05
+      max_height: 0.5
+      enabled: True
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: False
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: True
+      width: 4      # 4 x 4 metre local window around the mower
+      height: 4
+      resolution: 0.05
+      footprint: "{FOOTPRINT}"
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan ai_obstacles ai_boundary
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+          max_obstacle_height: 1.5
+          min_obstacle_height: 0.05
+          clearing: True
+          marking: True
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.1
+          obstacle_max_range: 2.2
+          obstacle_min_range: 0.1
+        # Dogs, poo, toys, trees and walls from the AI model (depth_fusion)
+        ai_obstacles:
+          topic: /vision/obstacle_points
+          data_type: "PointCloud2"
+          max_obstacle_height: 0.5
+          min_obstacle_height: 0.05
+          clearing: False
+          marking: True
+          obstacle_max_range: 4.0
+          obstacle_min_range: 0.1
+        # Lawn edge from the AI (ground that is not grass), keeps the mower on the lawn
+        ai_boundary:
+          topic: /vision/boundary_points
+          data_type: "PointCloud2"
+          max_obstacle_height: 0.5
+          min_obstacle_height: 0.05
+          clearing: False
+          marking: True
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.1
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 8.0
+        # Cost falls off up to this distance from obstacles; see omnimow.env
+        inflation_radius: {INFLATION_RADIUS}
+      always_send_full_costmap: True
+      filters: ["keepout_filter"]
+      # Lawn boundary and flower beds from mowing_control (only active while the mower is on the lawn)
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: True
+        filter_info_topic: "/costmap_filter_info"
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: False
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      # No static map: a rolling window big enough for a garden, remembering what the cameras saw
+      rolling_window: True
+      width: 40
+      height: 40
+      resolution: 0.05
+      track_unknown_space: True
+      footprint: "{FOOTPRINT}"
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan ai_obstacles ai_boundary
+        scan:
+          topic: /scan
+          data_type: "LaserScan"
+          max_obstacle_height: 1.5
+          min_obstacle_height: 0.05
+          clearing: True
+          marking: True
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.1
+          obstacle_max_range: 2.2
+          obstacle_min_range: 0.1
+        ai_obstacles:
+          topic: /vision/obstacle_points
+          data_type: "PointCloud2"
+          max_obstacle_height: 0.5
+          min_obstacle_height: 0.05
+          clearing: False
+          marking: True
+          obstacle_max_range: 4.0
+          obstacle_min_range: 0.1
+        # Lawn edge from the AI (ground that is not grass), keeps the mower on the lawn
+        ai_boundary:
+          topic: /vision/boundary_points
+          data_type: "PointCloud2"
+          max_obstacle_height: 0.5
+          min_obstacle_height: 0.05
+          clearing: False
+          marking: True
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.1
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 8.0
+        inflation_radius: {INFLATION_RADIUS}
+      always_send_full_costmap: True
+      filters: ["keepout_filter"]
+      # Lawn boundary and flower beds from mowing_control (only active while the mower is on the lawn)
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: True
+        filter_info_topic: "/costmap_filter_info"

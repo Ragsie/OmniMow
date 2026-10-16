@@ -31,22 +31,22 @@
     </visual>
   </link>
 
-  <!-- GNSS / RTK-GPS Receiver Joint (Rover) -->
-  <joint name="gps_joint" type="fixed">
-    <parent link="base_link"/>
-    <child link="gps_link"/>
-    <!-- Dynamic parameters are extracted from the launch file and injected here -->
-    <origin xyz="{GPS_OFFSET_X} 0.0 {GPS_HEIGHT_Z}" rpy="0.0 0.0 0.0"/>
+  <!-- Optical frame of the (rectified) left camera: Z forward, X right, Y down.
+       All stereo images, camera_info and the depth image are stamped in this frame. -->
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_optical_frame"/>
+    <origin xyz="0.0 0.0 0.0" rpy="-1.5707963 0.0 -1.5707963"/>
   </joint>
 
-  <link name="gps_link">
-    <visual>
-      <geometry>
-        <cylinder radius="0.05" length="0.02"/>
-      </geometry>
-      <material name="white">
-        <color rgba="1.0 1.0 1.0 1.0"/>
-      </material>
-    </visual>
-  </link>
+  <link name="camera_optical_frame"/>
+
+  <!-- BNO085 IMU on the drive controller board -->
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0.0 0.0 0.05" rpy="0.0 0.0 0.0"/>
+  </joint>
+
+  <link name="imu_link"/>
 </robot>

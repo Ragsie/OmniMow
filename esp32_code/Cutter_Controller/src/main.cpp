@@ -10,6 +10,14 @@
 #define CAN_TX_PIN GPIO_NUM_21
 #define CAN_RX_PIN GPIO_NUM_22
 
+// Serial is the micro-ROS transport, so plain prints corrupt the protocol stream.
+// Build with -D OMNIMOW_DEBUG_SERIAL only when testing without the micro-ROS agent.
+#ifdef OMNIMOW_DEBUG_SERIAL
+#define LOGLN(x) Serial.println(x)
+#else
+#define LOGLN(x)
+#endif
+
 // Autoro Single ESC (Cutter VESC ID)
 #define VESC_CUTTER_ID 3
 
@@ -87,7 +95,7 @@ void read_vesc_telemetry() {
                 // BLOCKING TEST: If the blade is supposed to run (ERPM > 1000),
                 // but the actual RPM is below 100 (blade is idle/stuck)
                 // and the current is simultaneously very high (> 15.0A), then the cutter is blocked!
-                if (expected_erpm > 1000 && abs(rpm) < 100 && current > 15.0) {
+                if (expected_erpm > 1000 && abs(rpm) < 100 && fabs(current) > 15.0) {
                     cutter_blocked = true;
                     set_cutter_rpm(0); // Immediate emergency stop to protect the motor and drivetrain
                     actual_rpm = 0;
@@ -136,18 +144,8 @@ void subscription_callback(const void * msvgin) {
 }
 
 void setup() {
-    // Initialize the optional BNO085 safety sensor over its dedicated I2C pins.
-    Wire.begin(BNO_SDA_PIN, BNO_SCL_PIN);
-    if (myIMU.begin() == false) {
-        Serial.println("Warning: BNO085 IMU not found! Check wiring on GPIO 25/26.");
-        imu_present = false;
-    } else {
-        // Enable rotation vector (Roll, Pitch, Yaw) with 50 ms polling speed (20 Hz)
-        myIMU.enableRotationVector(50);
-        Serial.println("BNO085 IMU initialized and running with stable sensor fusion!");
-        imu_present = true;
-    }
-
+    // Tilt/lift detection with the BNO085 runs on the drive controller.
+    Serial.begin(115200);  // micro-ROS transport, must match "-b" of microros_cutter in docker-compose.yml
     init_twai();
     set_microros_serial_transports(Serial);
 
@@ -205,11 +203,13 @@ void loop() {
     // Watchdog check. If the computer freezes, the blade is immediately switched off!
     unsigned long now_ms = millis();
     if (last_heartbeat_time > 0 && (now_ms - last_heartbeat_time > WATCHDOG_TIMEOUT_MS)) {
+        if (expected_erpm != 0) {
+            LOGLN("FATAL: CUTTER WATCHDOG TIMEOUT! Stopped cutting blade immediately!");
+        }
         expected_erpm = 0;
         set_cutter_rpm(0); // Switch blade off immediately!
         actual_rpm = 0;
         actual_current = 0.0;
-        Serial.println("FATAL: CUTTER WATCHDOG TIMEOUT! Stopped cutting blade immediately!");
     }
 
     rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));

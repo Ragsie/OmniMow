@@ -13,6 +13,8 @@
 #include <SparkFun_BNO080_Arduino_Library.h> // SparkFun BNO085 Library
 #include <std_msgs/msg/bool.h>               // Bool message type for rain sensor
 #include <sensor_msgs/msg/imu.h>
+#include <nav_msgs/msg/odometry.h>
+#include <rmw_microros/rmw_microros.h>      // Time sync with the ROS 2 agent
 
 #define CAN_TX_PIN GPIO_NUM_21
 #define CAN_RX_PIN GPIO_NUM_22
@@ -29,6 +31,24 @@
 // Daly BMS UART pins (Serial2 on ESP32)
 #define BMS_RX_PIN 16
 #define BMS_TX_PIN 17
+
+// Serial is the micro-ROS transport, so plain prints corrupt the protocol stream.
+// Build with -D OMNIMOW_DEBUG_SERIAL only when testing without the micro-ROS agent.
+#ifdef OMNIMOW_DEBUG_SERIAL
+#define LOG(x) Serial.print(x)
+#define LOGLN(x) Serial.println(x)
+#else
+#define LOG(x)
+#define LOGLN(x)
+#endif
+
+// Serial link to the micro-ROS agent. IMU (50 Hz) + odometry (20 Hz) need more than 115200 baud.
+// Must match "-b" of the microros_drive service in docker-compose.yml.
+#define MICROROS_BAUD 921600
+
+// Wheel speed scaling: ERPM = m/s * ERPM_PER_MPS (same factor for commands and odometry).
+// Calibrate: ERPM_PER_MPS = motor_pole_pairs * gear_ratio * 60 / (PI * wheel_diameter_m)
+#define ERPM_PER_MPS 3000.0
 
 // Autoro VESC IDs on the CAN bus (with #ifndef guards to prevent redefinition warnings from platformio.ini)
 #ifndef VESC_LEFT_ID
@@ -55,6 +75,8 @@ std_msgs__msg__Int32 cycles_msg;            //
 std_msgs__msg__Float32 drive_current_msg;   //
 std_msgs__msg__Bool rain_msg;               // ROS 2 rain sensor message
 sensor_msgs__msg__Imu imu_msg;
+rcl_publisher_t odom_pub;                   // Wheel odometry for FusionCore (/wheel/odom)
+nav_msgs__msg__Odometry odom_msg;
 rclc_executor_t executor;
 
 // The Radxa must refresh this timestamp; otherwise the hardware relay removes motor power.
@@ -66,6 +88,7 @@ rcl_allocator_t allocator;
 rcl_node_t node;
 
 volatile bool emergency_stop = false;
+bool can_stopped = false;                   // twai_stop() is not ISR-safe, so loop() stops the bus
 unsigned long last_bms_request = 0;         // BMS polling timer
 const unsigned long BMS_INTERVAL = 1000;    // Request data every second
 
@@ -80,11 +103,25 @@ unsigned long last_state_publish = 0;
 float left_current = 0.0;
 float right_current = 0.0;
 
+// Measured wheel speeds (m/s) from VESC status frames and the integrated odometry pose
+float measured_left_mps = 0.0;
+float measured_right_mps = 0.0;
+double odom_x = 0.0, odom_y = 0.0, odom_theta = 0.0;
+unsigned long last_odom_publish = 0;
+unsigned long last_time_sync = 0;
+
+// ROS time from the agent, so FusionCore can align IMU, wheels and visual odometry
+void stamp_now(builtin_interfaces__msg__Time &stamp) {
+    int64_t ns = rmw_uros_epoch_nanos();
+    stamp.sec = ns / 1000000000LL;
+    stamp.nanosec = ns % 1000000000LL;
+}
+
 // Hardware interrupt: triggers instantly on physical collision or STOP button
 void IRAM_ATTR handleBumper() {
     emergency_stop = true;
     digitalWrite(RELAY_PIN, LOW); // Cut power to the 40A automotive relay immediately!
-    twai_stop();                 // Stop the CAN bus to prevent any motor rotation
+    // The CAN bus is stopped from loop(), because twai_stop() must not be called from an ISR
 }
 
 // Initialize the TWAI driver at 500 kbps
@@ -95,9 +132,9 @@ void init_twai() {
 
     if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
         twai_start();
-        Serial.println("TWAI (CAN) driver installed and started.");
+        LOGLN("TWAI (CAN) driver installed and started.");
     } else {
-        Serial.println("Unable to install the TWAI driver.");
+        LOGLN("Unable to install the TWAI driver.");
     }
 }
 
@@ -159,8 +196,8 @@ void read_bms_data() {
                     battery_msg.present = true;
                     rcl_publish(&battery_pub, &battery_msg, NULL);
                 }
-                else if (buffer[2] == 0x91) { // Charge cycles
-                    uint16_t cycles = (buffer[8] << 8) | buffer[9];
+                else if (buffer[2] == 0x94) { // Status info 1: charge cycles in data bytes 5-6
+                    uint16_t cycles = (buffer[9] << 8) | buffer[10];
                     cycles_msg.data = cycles;
                     rcl_publish(&cycles_pub, &cycles_msg, NULL);
                 }
@@ -173,11 +210,6 @@ void read_bms_data() {
             }
         }
     }
-}
-
-// Heartbeat callback resets the watchdog timer
-void heartbeat_callback(const void * msvgin) {
-    last_heartbeat_time = millis();
 }
 
 // Refresh the watchdog whenever the ROS 2 heartbeat reaches the drive controller.
@@ -231,12 +263,14 @@ void read_drive_telemetry() {
             float current = ((int16_t)((rx_msg.data[4] << 8) | rx_msg.data[5])) / 10.0;
 
             if (sender_id == VESC_LEFT_ID) {
+                measured_left_mps = rpm / ERPM_PER_MPS;
                 left_current = abs(current);
                 if (abs(expected_erpm_left) > 1000 && abs(rpm) < 50 && left_current > 15.0) {
                     drive_stuck = true;
                 }
             }
             if (sender_id == VESC_RIGHT_ID) {
+                measured_right_mps = -rpm / ERPM_PER_MPS;  // Right motor is mirrored (see subscription_callback)
                 right_current = abs(current);
                 if (abs(expected_erpm_right) > 1000 && abs(rpm) < 50 && right_current > 15.0) {
                     drive_stuck = true;
@@ -273,12 +307,36 @@ void read_drive_telemetry() {
     }
 }
 
+// Differential-drive odometry from the measured wheel speeds, published at 20 Hz
+void publish_odometry() {
+    unsigned long now = millis();
+    if (now - last_odom_publish < 50) return;
+    double dt = (now - last_odom_publish) / 1000.0;
+    last_odom_publish = now;
+    if (dt > 0.5) dt = 0.05;  // First call or after a pause
+
+    double v = (measured_left_mps + measured_right_mps) / 2.0;
+    double w = (measured_right_mps - measured_left_mps) / TRACK_WIDTH;
+    odom_x += v * cos(odom_theta + w * dt / 2.0) * dt;
+    odom_y += v * sin(odom_theta + w * dt / 2.0) * dt;
+    odom_theta += w * dt;
+
+    stamp_now(odom_msg.header.stamp);
+    odom_msg.pose.pose.position.x = odom_x;
+    odom_msg.pose.pose.position.y = odom_y;
+    odom_msg.pose.pose.orientation.z = sin(odom_theta / 2.0);
+    odom_msg.pose.pose.orientation.w = cos(odom_theta / 2.0);
+    odom_msg.twist.twist.linear.x = v;
+    odom_msg.twist.twist.angular.z = w;
+    rcl_publish(&odom_pub, &odom_msg, NULL);
+}
+
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(MICROROS_BAUD);
 
     // Configure Daly BMS UART (Serial2)
     Serial2.begin(9600, SERIAL_8N1, BMS_RX_PIN, BMS_TX_PIN);
-    Serial.println("Daly Smart BMS UART2 (9600 baud) started.");
+    LOGLN("Daly Smart BMS UART2 (9600 baud) started.");
 
     pinMode(BUMPER_PIN, INPUT_PULLUP);
     pinMode(RELAY_PIN, OUTPUT);
@@ -292,12 +350,15 @@ void setup() {
     // Initialize BNO085 IMU over I2C on dedicated pins
     Wire.begin(BNO_SDA_PIN, BNO_SCL_PIN);
     if (myIMU.begin() == false) {
-        Serial.println("Warning: BNO085 IMU not found! Check wiring on GPIO 25/26.");
+        LOGLN("Warning: BNO085 IMU not found! Check wiring on GPIO 25/26.");
         imu_present = false;
     } else {
         // Enable rotation vector (Roll, Pitch, Yaw) at 50 ms polling rate (20 Hz)
         myIMU.enableRotationVector(50);
-        Serial.println("BNO085 IMU initialized and running with stable sensor fusion!");
+        // FusionCore needs the raw gyro and accelerometer, not only the orientation
+        myIMU.enableGyro(20);           // 50 Hz, rad/s
+        myIMU.enableAccelerometer(20);  // 50 Hz, m/s^2 including gravity
+        LOGLN("BNO085 IMU initialized and running with stable sensor fusion!");
         imu_present = true;
     }
 
@@ -351,6 +412,51 @@ void setup() {
         "/mower/rain"
     );
 
+    // IMU publisher used by the localization (/imu/data_raw)
+    rclc_publisher_init_default(
+        &imu_pub,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+        "/imu/data_raw"
+    );
+
+    // micro-ROS strings need size/capacity, otherwise frame_id is sent empty
+    static char imu_frame_id[] = "imu_link";
+    imu_msg.header.frame_id.data = imu_frame_id;
+    imu_msg.header.frame_id.size = strlen(imu_frame_id);
+    imu_msg.header.frame_id.capacity = sizeof(imu_frame_id);
+
+    // Covariances are diagonal (index 0, 4, 8); off-diagonal terms stay 0
+    for (int i = 0; i < 9; i += 4) {
+        imu_msg.orientation_covariance[i] = 0.001;
+        imu_msg.angular_velocity_covariance[i] = 0.0001;      // ~0.01 rad/s
+        imu_msg.linear_acceleration_covariance[i] = 0.01;     // ~0.1 m/s^2
+    }
+
+    // Wheel odometry (twist is what FusionCore fuses; pose is dead reckoning only)
+    rclc_publisher_init_default(
+        &odom_pub,
+        &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+        "/wheel/odom"
+    );
+    static char odom_frame_id[] = "odom";
+    static char base_frame_id[] = "base_link";
+    odom_msg.header.frame_id.data = odom_frame_id;
+    odom_msg.header.frame_id.size = strlen(odom_frame_id);
+    odom_msg.header.frame_id.capacity = sizeof(odom_frame_id);
+    odom_msg.child_frame_id.data = base_frame_id;
+    odom_msg.child_frame_id.size = strlen(base_frame_id);
+    odom_msg.child_frame_id.capacity = sizeof(base_frame_id);
+    for (int i = 0; i < 36; i += 7) {
+        odom_msg.pose.covariance[i] = 0.1;
+        odom_msg.twist.covariance[i] = 0.0025;              // 0.05 m/s
+    }
+    odom_msg.twist.covariance[35] = 0.0004;                 // 0.02 rad/s yaw rate
+
+    // Sync the clock with the agent so all sensor stamps are in ROS time
+    rmw_uros_sync_session(1000);
+
     // Reserve one executor handle for /cmd_vel and one for /mower/heartbeat.
     rclc_executor_init(&executor, &support.context, 2, &allocator);
     rclc_executor_add_subscription(&executor, &subscriber, &msg_twist, &subscription_callback, ON_NEW_DATA);
@@ -371,8 +477,7 @@ void loop() {
     if (!emergency_stop && last_heartbeat_time > 0 && (now_ms - last_heartbeat_time > WATCHDOG_TIMEOUT_MS)) {
         emergency_stop = true;
         digitalWrite(RELAY_PIN, LOW); // Immediate physical emergency stop of the 40A automotive relay!
-        twai_stop();                 // Shut down the CAN bus immediately to stop the motors
-        Serial.println("FATAL: WATCHDOG TIMEOUT! Radxa computer stopped responding. Power cut!");
+        LOGLN("FATAL: WATCHDOG TIMEOUT! Radxa computer stopped responding. Power cut!");
     }
 
     // BNO085 tilt (roll) and lift monitoring for extreme physical safety
@@ -380,21 +485,19 @@ void loop() {
         float roll = (myIMU.getRoll()) * 180.0 / PI;   // Convert Pitch/Roll radians to degrees
         float pitch = (myIMU.getPitch()) * 180.0 / PI;
 
-        imu_msg.header.frame_id.data = (char*)"imu_link";
-        imu_msg.header.stamp.sec = millis() / 1000;
-        imu_msg.header.stamp.nanosec = (millis() % 1000) * 1000000;
+        stamp_now(imu_msg.header.stamp);
 
         imu_msg.orientation.x = myIMU.getQuatI();
         imu_msg.orientation.y = myIMU.getQuatJ();
         imu_msg.orientation.z = myIMU.getQuatK();
         imu_msg.orientation.w = myIMU.getQuatReal();
 
-        // Standard high covariance if not reporting raw linear acceleration/angular velocity
-        for (int i = 0; i < 9; i++) {
-            imu_msg.orientation_covariance[i] = 0.001;
-            imu_msg.angular_velocity_covariance[i] = 0.01;
-            imu_msg.linear_acceleration_covariance[i] = 0.1;
-        }
+        imu_msg.angular_velocity.x = myIMU.getGyroX();
+        imu_msg.angular_velocity.y = myIMU.getGyroY();
+        imu_msg.angular_velocity.z = myIMU.getGyroZ();
+        imu_msg.linear_acceleration.x = myIMU.getAccelX();
+        imu_msg.linear_acceleration.y = myIMU.getAccelY();
+        imu_msg.linear_acceleration.z = myIMU.getAccelZ();
 
         if (!emergency_stop) {
             rcl_publish(&imu_pub, &imu_msg, NULL);
@@ -404,11 +507,16 @@ void loop() {
         if (!emergency_stop && (abs(roll) > 35.0 || abs(pitch) > 35.0)) {
             emergency_stop = true;
             digitalWrite(RELAY_PIN, LOW); // Cut power to 40A main relay immediately!
-            twai_stop();                 // Stop CAN bus to halt motor rotation
-            Serial.print("FATAL: EMERGENCY STOP! Lift/Tilt detected! ");
-            Serial.print("Roll: "); Serial.print(roll, 1);
-            Serial.print("deg | Pitch: "); Serial.print(pitch, 1); Serial.println("deg");
+            LOG("FATAL: EMERGENCY STOP! Lift/Tilt detected! Roll: "); LOG(roll);
+            LOG(" deg | Pitch: "); LOG(pitch); LOGLN(" deg");
         }
+    }
+
+    // Stop the CAN bus once after any emergency stop (bumper ISR, watchdog or tilt)
+    if (emergency_stop && !can_stopped) {
+        digitalWrite(RELAY_PIN, LOW);
+        twai_stop();
+        can_stopped = true;
     }
 
     if (!emergency_stop) {
@@ -423,7 +531,7 @@ void loop() {
                 request_bms_data(0x90);
                 bms_state = 1;
             } else if (bms_state == 1) {
-                request_bms_data(0x91);
+                request_bms_data(0x94);
                 bms_state = 2;
             } else {
                 request_bms_data(0x92);
@@ -433,6 +541,13 @@ void loop() {
 
         read_bms_data();
         read_drive_telemetry();
+        publish_odometry();
+
+        // Re-sync the clock every 10 s to compensate for ESP32 crystal drift
+        if (now - last_time_sync >= 10000) {
+            last_time_sync = now;
+            rmw_uros_sync_session(10);
+        }
     } else {
         unsigned long now = millis();
         if (now - last_state_publish >= 1000) {

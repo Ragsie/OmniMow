@@ -1,0 +1,42 @@
+# ==============================================================================
+# FusionCore Sensor Fusion Configuration (replaces robot_localization)
+# Integrates 23-State UKF with Automatic Visual Odometry Fallback
+# ==============================================================================
+fusioncore:
+  ros__parameters:
+    use_sim_time: false
+    map_frame: map
+    odom_frame: odom
+    base_frame: base_link
+    publish_tf: true
+    publish_frequency: 100.0  # Ultra-stable 100Hz odometry feedback
+
+    # Fused Sensor Feeds
+    fuse_imu: true
+    fuse_odom: true
+    fuse_gnss: true
+    fuse_visual_odom: true    # Enable Stereo Visual Odometry fallback for GPS-shadowed areas
+
+    # Sensor Topics
+    imu_topic: "/imu/data_raw"
+    gnss_topic: "/gps/fix"
+    odom_topic: "/odom"
+    visual_odom_topic: "/visual_odom"  # Published by Stereo Visual Odometry pipeline
+
+    # Chassis Kinematics
+    track_width: 0.325   # Worx Landroid wheel baseline (meters)
+    wheel_radius: 0.10   # Wheel radius (meters)
+
+    # Adaptive Noise Scaling
+    # Automatically scales covariance noise parameters based on real-time sensor innovation
+    adaptive_covariance: true
+
+    # Outlier Rejection Gates (Chi-Squared Gating)
+    # Rejects faulty GPS multi-pathing or extreme wheel slippage automatically
+    gnss_gate_threshold: 5.99         # 95% confidence interval for 2 DOF position
+    imu_gate_threshold: 7.81          # 95% confidence interval for IMU measurements
+    visual_odom_gate_threshold: 7.81   # 95% confidence interval for Visual Odometry
+
+    # Sensor Lever Arms & Offsets (Relative to robot center/base_link)
+    antenna_offset: [-0.15, 0.0, 0.25]  # Matches OMNIMOW_GPS_OFFSET_X and HEIGHT_Z
+    camera_offset: [0.25, 0.0, 0.10]    # Matches OMNIMOW_CAMERA_OFFSET_X and HEIGHT_Z

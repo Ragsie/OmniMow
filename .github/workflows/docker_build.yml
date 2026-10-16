@@ -1,4 +1,4 @@
-name: OmniMow Docker Build and Release
+name: OmniMow Docker Build and Publish
 
 on:
   push:
@@ -18,14 +18,15 @@ jobs:
     - name: Checkout source code
       uses: actions/checkout@v4
 
+    #
     - name: Convert repository path to lowercase
       run: |
         echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
 
-    - name: Set up QEMU (enables cross-compilation to arm64)
+    - name: Setup QEMU (Enable cross-compilation to arm64)
       uses: docker/setup-qemu-action@v3
 
-    - name: Set up Docker Buildx
+    - name: Setup Docker Buildx
       uses: docker/setup-buildx-action@v3
 
     - name: Log in to GHCR (GitHub Container Registry)
@@ -35,7 +36,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Build and release ${{ matrix.service }} Docker image
+    - name: Compile and publish ${{ matrix.service }} Docker Image
       uses: docker/build-push-action@v5
       with:
         context: ./${{ matrix.service }}

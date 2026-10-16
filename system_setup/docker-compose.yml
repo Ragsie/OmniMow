@@ -1,4 +1,5 @@
-version: '3.8'
+# OmniMow on Radxa Dragon Q6A - Ubuntu 24.04 / ROS 2 Jazzy.
+# All services share ROS_DOMAIN_ID=1 over the host network.
 
 services:
   # Stereo Vision Service (Virtual LiDAR scan generation from dual MIPI CSI)
@@ -10,18 +11,46 @@ services:
     restart: unless-stopped
     network_mode: host
     ipc: host
-    # Shared memory lets the stereo node exchange camera data efficiently.
-    devices:
-      - /dev/video0:/dev/video0
-      - /dev/video1:/dev/video1
+    # libcamera needs the camera's media, subdev and video nodes plus udev to find the cameras
+    privileged: true
     volumes:
-      - /dev/shm:/dev/shm
+      - /dev/shm:/dev/shm  # Shared memory lets the stereo node exchange camera data efficiently
+      - /run/udev:/run/udev:ro
+      - /opt/omnimow/calibration:/calibration  # Stereo calibration (created on first boot)
     env_file:
       - ./omnimow.env
     environment:
       - ROS_DOMAIN_ID=1
 
-  # ROSbridge Websocket Service (API and mobile App communication)
+  # micro-ROS agents: bridge the two ESP32s (serial) into ROS 2. Without them the ESP32
+  # topics (/cmd_vel, /battery_state, /mower/heartbeat, /cutter/*) never reach ROS.
+  # The baud rates must match MICROROS_BAUD / Serial.begin() in the ESP32 firmware.
+  # Test setup: only started with the ESP32s connected: docker compose --profile esp32 up -d
+  microros_drive:
+    image: microros/micro-ros-agent:jazzy
+    profiles: ["esp32"]
+    container_name: omnimow_microros_drive
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/ttyUSB_esp32_drive:/dev/ttyUSB_esp32_drive
+    environment:
+      - ROS_DOMAIN_ID=1
+    command: serial --dev /dev/ttyUSB_esp32_drive -b 921600
+
+  microros_cutter:
+    image: microros/micro-ros-agent:jazzy
+    profiles: ["esp32"]
+    container_name: omnimow_microros_cutter
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/ttyUSB_esp32_cutter:/dev/ttyUSB_esp32_cutter
+    environment:
+      - ROS_DOMAIN_ID=1
+    command: serial --dev /dev/ttyUSB_esp32_cutter -b 115200
+
+  # ROSbridge Websocket Service (API and mobile App communication) - port 8000
   rosbridge_websocket:
     build:
       context: ../rosbridge_websocket
@@ -32,7 +61,7 @@ services:
     environment:
       - ROS_DOMAIN_ID=1
 
-  # Qualcomm NPU inference service for segmentation and obstacle masking.
+  # AI vision on the Hexagon NPU (QNN context binary) + fusion with stereo depth.
   depth_fusion:
     build:
       context: ../depth_fusion
@@ -41,27 +70,90 @@ services:
     restart: unless-stopped
     network_mode: host
     ipc: host
-    # Grants container full access to Qualcomm DSP/NPU FastRPC channels
-    devices:
-      - /dev/fastrpc-adsp:/dev/fastrpc-adsp
-      - /dev/fastrpc-cdsp:/dev/fastrpc-cdsp
-      - /dev/fastrpc-cdsp-secure:/dev/fastrpc-cdsp-secure
-      - /dev/dri:/dev/dri
+    # FastRPC to the NPU needs /dev/fastrpc-*, /dev/dma_heap and the DSP firmware
+    privileged: true
     volumes:
       - /dev/shm:/dev/shm
-      - /opt/omnimow/models:/models
-      - /opt/omnimow/incoming_raw:/incoming_raw
-      - /opt/qcom/snpe:/opt/qcom/snpe
-      - /lib/firmware:/lib/firmware:ro  # Mounts proprietary firmware blobs for the Hexagon DSP
+      - /opt/omnimow/models:/models                # MowerAIn_seg_htp_context.bin (deployed by the model training pipeline)
+      - /opt/omnimow/incoming_raw:/incoming_raw    # Active learning images -> training server
+      - /usr/lib/aarch64-linux-gnu:/host-lib:ro    # Host FastRPC library (libcdsprpc)
+      - /lib/firmware:/lib/firmware:ro             # Hexagon DSP firmware blobs
+      # DSP files for FastRPC: it loads the DSP shell (fastrpc_shell_unsigned_3) only from fixed
+      # folders (/usr/lib/dsp/cdsp, linked on the host to the board folder in /usr/share/qcom);
+      # start_depth_fusion.sh also puts the board folder on ADSP_LIBRARY_PATH
+      - /usr/lib/dsp:/usr/lib/dsp:ro
+      - /usr/share/qcom:/usr/share/qcom:ro
+      - /dev/log:/dev/log   # FastRPC logs to syslog: its messages land in the host journal
     env_file:
       - ./omnimow.env
     environment:
       - ROS_DOMAIN_ID=1
-      - SNPE_ROOT=/opt/qcom/snpe
-      - LD_LIBRARY_PATH=/opt/qcom/snpe/lib/aarch64-ubuntu-gcc9.4:/lib/firmware
-      - PYTHONPATH=/opt/qcom/snpe/lib/python
 
-  # App Backend (Status overview, GPS RTK, and control broker)
+  # Visual SLAM (RTAB-Map stereo): visual odometry + loop closures on garden landmarks -> TF map -> odom
+  slam:
+    build:
+      context: ../slam
+      dockerfile: Dockerfile
+    container_name: omnimow_slam
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    volumes:
+      - /opt/omnimow/maps:/maps  # rtabmap.db - the map of the garden, kept between boots
+    env_file:
+      - ./omnimow.env
+    environment:
+      - ROS_DOMAIN_ID=1
+
+  # FusionCore localization (IMU + wheel odometry + visual odometry) -> TF odom -> base_link, /fusion/odom
+  localization:
+    # Built from FusionCore's own Dockerfile: the published ghcr.io image is amd64-only
+    build:
+      context: https://github.com/manankharwar/fusioncore.git#v0.4.0
+    image: omnimow/fusioncore:0.4.0
+    container_name: omnimow_localization
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    volumes:
+      - ./localization:/config:ro
+    env_file:
+      - ./omnimow.env
+    environment:
+      - ROS_DOMAIN_ID=1
+    # The image's entrypoint sources ROS + the FusionCore workspace, then runs this
+    command: ["/config/start_localization.sh"]
+
+  # Nav2 (planner, controller, collision monitor) - see navigation/nav2_params.yaml
+  navigation:
+    build:
+      context: ../navigation
+      dockerfile: Dockerfile
+    container_name: omnimow_navigation
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    env_file:
+      - ./omnimow.env
+    environment:
+      - ROS_DOMAIN_ID=1
+
+  # Mowing missions: coverage paths, blade, hazard pause, battery return, zone recording
+  mowing_control:
+    build:
+      context: ../mowing_control
+      dockerfile: Dockerfile
+    container_name: omnimow_mowing_control
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /opt/omnimow:/opt/omnimow  # zones.json and mowing_progress.json
+    env_file:
+      - ./omnimow.env
+    environment:
+      - ROS_DOMAIN_ID=1
+
+  # App Backend (status overview, schedule and control broker) - port 9000
   app_backend:
     build:
       context: ../app_backend
@@ -69,8 +161,8 @@ services:
     container_name: omnimow_app_backend
     restart: unless-stopped
     network_mode: host
-    devices:
-      - /dev/ttyUSB_gps_rover:/dev/ttyUSB_gps_rover
+    volumes:
+      - /opt/omnimow:/opt/omnimow  # stats.json, schedule, calibration status survive container updates
     environment:
       - ROS_DOMAIN_ID=1
 
@@ -86,24 +178,3 @@ services:
       - ./omnimow.env
     environment:
       - ROS_DOMAIN_ID=1
-
-  # FusionCore Localization Service Replaces robot_localization with advanced 23-state ECEF UKF
-  localization:
-    image: ghcr.io/manankharwar/fusioncore:latest
-    container_name: omnimow_localization
-    restart: unless-stopped
-    network_mode: host
-    ipc: host
-    volumes:
-      - ./fusioncore_config.yaml:/config/robot.yaml:ro
-    env_file:
-      - ./omnimow.env
-    environment:
-      - ROS_DOMAIN_ID=1
-    command: >
-      ros2 launch fusioncore_ros fusioncore.launch.py
-      fusioncore_config:=/config/robot.yaml
-      --ros-args
-      -r /imu/data:=/imu/data_raw
-      -r /gnss/fix:=/gps/fix
-      -r /odom:=/odom

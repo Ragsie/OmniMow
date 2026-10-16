@@ -13,14 +13,15 @@ jobs:
     - name: Checkout source code
       uses: actions/checkout@v4
 
-    - name: Load OmniMow environment variables from omnimow.env into GitHub Actions
+    - name: Load OmniMow environment variables from omnimow.env to GitHub Actions
       run: |
         grep -v '^#' system_setup/omnimow.env >> $GITHUB_ENV
-
-    - name: Set up Python environment
+      
+    - name: Setup Python Environment
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
+        #
 
     - name: Install testing tools and static analyzers
       run: |
@@ -28,18 +29,18 @@ jobs:
         pip install flake8
         sudo apt-get update && sudo apt-get install -y cppcheck shellcheck
 
-    - name: Python static analysis (flake8)
+    - name: Python Static Analysis (flake8)
       run: |
-        # Stop on syntax errors or undefined variables in the active Python modules
+        # Stop pipeline on syntax errors or undefined variables in active Python modules
         flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Warnings and style checks (remaining code)
+        # Warnings and style checks (Remaining codebase)
         flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
-    - name: C++ firmware analysis (cppcheck)
+    - name: C++ Firmware Analysis (cppcheck)
       run: |
         cppcheck --enable=all --suppress=missingIncludeSystem ./esp32_code/
 
-    - name: Shell script analysis (shellcheck)
+    - name: Shell Script Analysis (shellcheck)
       run: |
-        # Static analysis of the robot's setup and startup scripts
+        # Static analysis of host setup and startup scripts
         shellcheck system_setup/host_setup.sh stereo_vision/start_vision.sh

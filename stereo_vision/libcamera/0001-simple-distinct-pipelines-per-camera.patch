@@ -1,0 +1,79 @@
+libcamera simple pipeline: give each camera its own CSID/VFE path
+
+The simple pipeline handler picks the shortest path from each sensor to a
+capture node. On qcom-camss every CSIPHY links to every CSID, so both IMX219
+sensors of the OmniMow stereo pair got csiphyN -> msm_csid0 -> msm_vfe0_rdi0
+and the second camera failed to start ("Failed to setup link 'msm_csiphy3'[1]
+-> 'msm_csid0'[0]: Device or resource busy"). Later cameras now first look for
+a path that avoids the entities of the cameras found before (csid1/vfe1 for
+the second sensor) and only fall back to a shared path if there is none.
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 4a0b9f5..1e0a53b 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -426,6 +426,14 @@ public:
+ 	V4L2VideoDevice *video(const MediaEntity *entity);
+ 	V4L2Subdevice *subdev(const MediaEntity *entity);
+ 	std::shared_ptr<MediaDevice> converter() { return converter_; }
++
++	/*
++	 * Entities used by the pipelines of the cameras created so far. Later
++	 * cameras prefer paths that avoid them, so that sensors which can reach
++	 * several receivers (e.g. the CSIDs/VFEs of qcom-camss) get distinct
++	 * pipelines and can stream concurrently.
++	 */
++	std::unordered_set<const MediaEntity *> claimedEntities_;
+ 	bool swIspEnabled() const { return swIspEnabled_; }
+ 
+ protected:
+@@ -490,6 +498,17 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 	MediaEntity *video = nullptr;
+ 	MediaPad *sinkPad;
+ 
++	/*
++	 * First search for a path that avoids the entities used by the cameras
++	 * found before, then fall back to any path (shared with another camera,
++	 * which can then only be used exclusively).
++	 */
++	for (bool avoidClaimed : { true, false }) {
++	visited.clear();
++	parents.clear();
++	queue = {};
++	entity = nullptr;
++	video = nullptr;
+ 	queue.push({ sensor, nullptr });
+ 
+ 	while (!queue.empty()) {
+@@ -533,6 +552,8 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 		for (const MediaPad *pad : pads) {
+ 			for (MediaLink *link : pad->links()) {
+ 				MediaEntity *next = link->sink()->entity();
++				if (avoidClaimed && pipe->claimedEntities_.count(next))
++					continue;
+ 				if (visited.find(next) == visited.end()) {
+ 					queue.push({ next, link->sink() });
+ 
+@@ -543,6 +564,10 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 		}
+ 	}
+ 
++	if (video)
++		break;
++	}
++
+ 	if (!video)
+ 		return;
+ 
+@@ -560,6 +585,11 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 		entity = e.entity;
+ 	}
+ 
++	for (const Entity &e : entities_) {
++		if (e.entity != sensor)
++			pipe->claimedEntities_.insert(e.entity);
++	}
++
+ 	/* Finally also remember the sensor. */
+ 	sensor_ = CameraSensorFactoryBase::create(sensor);
+ 	if (!sensor_)

@@ -4,6 +4,8 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from std_srvs.srv import Trigger
 from geometry_msgs.msg import Twist, PoseStamped
 from sensor_msgs.msg import BatteryState
@@ -23,10 +25,13 @@ class OmniMowDockingController(Node):
         self.dock_speed = float(os.getenv('OMNIMOW_DOCK_SPEED', '0.05')) # Very slow and safe driving
         self.max_distance = float(os.getenv('OMNIMOW_DOCK_MAX_DISTANCE', '2.0')) # Safety timer (meters)
 
-        # 2. Create pub/sub and action clients
+        # 2. Create pub/sub and action clients.
+        # The service callbacks block while docking, so everything runs in a reentrant group on a
+        # MultiThreadedExecutor - otherwise Nav2 results and battery messages could never arrive.
+        self.cb_group = ReentrantCallbackGroup()
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.battery_sub = None # Dynamically created during local docking to save resources
-        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose', callback_group=self.cb_group)
 
         # 3. System status flags
         self.is_charging = False
@@ -34,8 +39,18 @@ class OmniMowDockingController(Node):
         self.current_charge_amps = 0.0
 
         # 4. Create services for external control (app and backend)
-        self.dock_srv = self.create_service(Trigger, '/omnimow/dock', self.handle_dock_request)
-        self.undock_srv = self.create_service(Trigger, '/omnimow/undock', self.handle_undock_request)
+        self.dock_srv = self.create_service(Trigger, '/omnimow/dock', self.handle_dock_request, callback_group=self.cb_group)
+        self.undock_srv = self.create_service(Trigger, '/omnimow/undock', self.handle_undock_request, callback_group=self.cb_group)
+
+    @staticmethod
+    def wait_for_future(future, timeout_sec=None):
+        """Wait for a future that the executor completes in another thread."""
+        start = time.time()
+        while not future.done():
+            if timeout_sec is not None and time.time() - start > timeout_sec:
+                return False
+            time.sleep(0.05)
+        return True
 
     def battery_callback(self, msg: BatteryState):
         """Update charging state from the battery data published by the ESP32."""
@@ -51,14 +66,15 @@ class OmniMowDockingController(Node):
         self.get_logger().info('Docking request received. Starting 2-step docking algorithm...')
         self.is_charging = False
 
-        # Step 1: use Nav2 and the fused RTK pose to reach a safe staging position.
+        # Step 1: use Nav2 and the visual SLAM pose to reach a safe staging position.
         if not self.nav_client.wait_for_action_server(timeout_sec=5.0):
             response.success = False
             response.message = "Nav2 action server is not available. Cannot find the staging pose."
             return response
 
-        self.get_logger().info(f"Navigating to staging pose: X={self.staging_x}, Y={self.staging_y} using RTK-GPS...")
+        self.get_logger().info(f"Navigating to staging pose: X={self.staging_x}, Y={self.staging_y} (map frame)...")
         goal_msg = NavigateToPose.Goal()
+        # RTAB-Map's garden map: the origin is the charging station where mapping started
         goal_msg.pose.header.frame_id = "map"
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
         goal_msg.pose.pose.position.x = self.staging_x
@@ -72,7 +88,7 @@ class OmniMowDockingController(Node):
 
         # Send target to Nav2
         send_goal_future = self.nav_client.send_goal_async(goal_msg)
-        rclpy.spin_until_future_complete(self, send_goal_future)
+        self.wait_for_future(send_goal_future)
 
         goal_handle = send_goal_future.result()
         if not goal_handle.accepted:
@@ -82,7 +98,7 @@ class OmniMowDockingController(Node):
 
         self.get_logger().info("Staging pose accepted. Waiting for arrival...")
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        self.wait_for_future(result_future)
 
         status = result_future.result().status
         if status != 4: # 4 = SUCCEEDED in action status codes
@@ -97,11 +113,11 @@ class OmniMowDockingController(Node):
             BatteryState,
             '/battery_state',
             self.battery_callback,
-            10
+            10,
+            callback_group=self.cb_group
         )
 
         # The timeout converts the maximum permitted travel distance into a time limit.
-        rate = self.create_rate(10) # 10 Hz
         start_time = time.time()
         timeout_duration = self.max_distance / self.dock_speed # e.g. 2.0m / 0.05m/s = 40 seconds
 
@@ -111,17 +127,15 @@ class OmniMowDockingController(Node):
 
         success = False
         while (time.time() - start_time) < timeout_duration:
-            # Ensure rclpy callbacks run so the battery measurements are refreshed
-            rclpy.spin_once(self, timeout_sec=0.01)
-
+            # battery_callback runs in another executor thread and updates is_charging
             if self.is_charging:
                 self.get_logger().info(f"Charging detected! Voltage: {self.current_voltage:.2f}V, Current: {self.current_charge_amps:.2f}A.")
                 success = True
                 break
 
-            # Send drive command
+            # Send drive command (10 Hz)
             self.cmd_vel_pub.publish(twist_cmd)
-            rate.sleep()
+            time.sleep(0.1)
 
         # Stop the wheels immediately regardless of outcome
         stop_cmd = Twist()
@@ -144,8 +158,6 @@ class OmniMowDockingController(Node):
         """Back out of the charging station and rotate clear of the dock tower."""
         self.get_logger().info('Undocking request received. Backing out of the charging station...')
 
-        rate = self.create_rate(10)
-
         # 1. Drive slowly backward for 8 seconds to back out of the charging contacts
         back_cmd = Twist()
         back_cmd.linear.x = -0.08 # m/s
@@ -153,7 +165,7 @@ class OmniMowDockingController(Node):
 
         for _ in range(80): # 80 loops * 0.1s = 8 seconds (~64 cm)
             self.cmd_vel_pub.publish(back_cmd)
-            rate.sleep()
+            time.sleep(0.1)
 
         # 2. Rotate 0.3 rad/s away for 3 seconds so the dock tower is fully cleared
         turn_cmd = Twist()
@@ -162,7 +174,7 @@ class OmniMowDockingController(Node):
 
         for _ in range(30): # 30 loops * 0.1s = 3 seconds
             self.cmd_vel_pub.publish(turn_cmd)
-            rate.sleep()
+            time.sleep(0.1)
 
         # 3. Stop completely
         stop_cmd = Twist()
@@ -176,8 +188,10 @@ class OmniMowDockingController(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = OmniMowDockingController()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

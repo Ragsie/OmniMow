@@ -1,16 +1,16 @@
 from launch import LaunchDescription
+from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
-from ament_index_python.packages import get_package_share_directory
 import os
+
+# stereo_vision is copied into /app as plain files (not a colcon-built ROS package),
+# so all paths are resolved relative to this launch file.
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def generate_launch_description():
     """Build the robot TF and stereo nodes from the shared hardware configuration."""
 
-    urdf_file = os.path.join(
-        get_package_share_directory('stereo_vision'),
-        'urdf',
-        'OmniMower.urdf'
-    )
+    urdf_file = os.path.join(APP_DIR, 'urdf', 'OmniMower.urdf')
 
     with open(urdf_file, 'r') as infp:
         robot_desc = infp.read()
@@ -19,47 +19,16 @@ def generate_launch_description():
     camera_x = os.getenv('OMNIMOW_CAMERA_OFFSET_X', '0.25')
     camera_z = os.getenv('OMNIMOW_CAMERA_HEIGHT_Z', '0.10')
     camera_pitch = os.getenv('OMNIMOW_CAMERA_PITCH_Y', '0.0')
-    gps_x = os.getenv('OMNIMOW_GPS_OFFSET_X', '-0.15')
-    gps_z = os.getenv('OMNIMOW_GPS_HEIGHT_Z', '0.25')
 
-    device_left = os.getenv('OMNIMOW_CAMERA_DEVICE_LEFT', '/dev/video0')
-    device_right = os.getenv('OMNIMOW_CAMERA_DEVICE_RIGHT', '/dev/video1')
+    # Baseline and focal length come from the stereo calibration (calibrate_stereo.py)
+    calibration_dir = os.getenv('OMNIMOW_CALIB_DIR', '/calibration')
 
-    baseline = float(os.getenv('OMNIMOW_CAMERA_BASELINE', '0.06'))
-    focal_length = float(os.getenv('OMNIMOW_CAMERA_FOCAL_LENGTH', '350.0'))
-
-    # Dynamic Nav2 parameter injection for the asymmetric cutter head.
-    # To prevent the asymmetric cutter head from scraping against obstacles,
-    # we load the Nav2 yaml template and replace robot_radius and inflation_radius
-    # with values directly from omnimow.env before running.
-    nav2_template_file = os.path.join(
-        get_package_share_directory('stereo_vision'),
-        'config',
-        'nav2_params.yaml'
-    )
-    resolved_nav2_file = '/tmp/nav2_params_resolved.yaml'
-
-    if os.path.exists(nav2_template_file):
-        with open(nav2_template_file, 'r') as f:
-            nav2_template = f.read()
-
-        # Resolve placeholders using the dimensions selected for this mower.
-        nav2_resolved = nav2_template.format(
-            ROBOT_RADIUS=os.getenv('OMNIMOW_ROBOT_RADIUS', '0.28'),
-            INFLATION_RADIUS=os.getenv('OMNIMOW_NAV2_INFLATION_RADIUS', '0.48')
-        )
-
-        # Save the finished runtime configuration for Nav2
-        with open(resolved_nav2_file, 'w') as f:
-            f.write(nav2_resolved)
-        print(f"[OmniMow Launch] Dynamic Nav2 configuration saved in {resolved_nav2_file} with inflation={os.getenv('OMNIMOW_NAV2_INFLATION_RADIUS', '0.48')}m")
+    # Nav2 (incl. robot radius / inflation from omnimow.env) runs in its own container: navigation/
 
     robot_desc_formatted = robot_desc.format(
         CAMERA_OFFSET_X=camera_x,
         CAMERA_HEIGHT_Z=camera_z,
-        CAMERA_PITCH_Y=camera_pitch,
-        GPS_OFFSET_X=gps_x,
-        GPS_HEIGHT_Z=gps_z
+        CAMERA_PITCH_Y=camera_pitch
     )
 
     return LaunchDescription([
@@ -72,20 +41,15 @@ def generate_launch_description():
             parameters=[{'robot_description': robot_desc_formatted}]
         ),
         # Start the central 3D Stereo Vision node (with parameters from omnimow.env) [MIGRATED TO DUAL CAM]
-        Node(
-            package='stereo_vision',
-            executable='stereo_node.py',
-            name='stereo_node',
-            output='screen',
-            parameters=[{
-                'video_device_left': device_left,
-                'video_device_right': device_right,
-                'frame_id': 'camera_link',
-                'baseline': baseline,
-                'focal_length': focal_length,
-                'camera_height_z': float(camera_z),
-                'camera_offset_x': float(camera_x),
-                'camera_pitch_y': float(camera_pitch)
-            }]
+        ExecuteProcess(
+            cmd=[
+                'python3', os.path.join(APP_DIR, 'stereo_node.py'),
+                '--ros-args', '-r', '__node:=stereo_node',
+                '-p', f'calibration_dir:={calibration_dir}',
+                '-p', f'camera_height_z:={float(camera_z)}',
+                '-p', f'camera_offset_x:={float(camera_x)}',
+                '-p', f'camera_pitch_y:={float(camera_pitch)}',
+            ],
+            output='screen'
         )
     ])

@@ -1,0 +1,62 @@
+# FusionCore config for OmniMow without GPS: BNO085 IMU + VESC wheel odometry + RTAB-Map stereo
+# visual odometry (fed back as a second velocity source, as in rtabmap_ros' FusionCore demo).
+#
+# Output: /fusion/odom and TF odom -> base_link. RTAB-Map corrects the drift on top of this with
+# loop closures against landmarks in the garden (TF map -> odom).
+
+fusioncore:
+  ros__parameters:
+    base_frame: base_link
+    odom_frame: odom
+    publish_rate: 100.0
+    publish.force_2d: true
+    publish.tf: true
+    motion_model: "DifferentialDrive"
+
+    # ── Inputs ────────────────────────────────────────────────────────────────
+    imu.topic: "/imu/data_raw"                  # Drive ESP32 (BNO085)
+    encoder.topic: "/wheel/odom"                # Drive ESP32 (VESC ERPM)
+    encoder2.topic: "/rtabmap/stereo_odometry"  # slam container (stereo visual odometry)
+    gnss.enabled: false                         # No GPS on OmniMow
+    init.wait_for_all_sensors: false            # Visual odometry needs FusionCore's odom first
+
+    # ── IMU: Bosch BNO085 ─────────────────────────────────────────────────────
+    imu.has_magnetometer: false       # Motors and the steel deck disturb the magnetometer
+    imu.gyro_noise: 0.005
+    imu.accel_noise: 0.15             # Mower deck vibrates
+    imu.remove_gravitational_acceleration: false  # ESP32 publishes raw accelerometer incl. gravity
+    imu.frame_id: "imu_link"
+
+    # ── Wheel odometry (slips on wet grass) and visual odometry ─────────────────
+    encoder.vel_noise: 0.08
+    encoder.yaw_noise: 0.03
+    encoder2.vel_noise: 0.05
+
+    magnetometer.enabled: false
+
+    # ── Outlier rejection & adaptive noise ───────────────────────────────────
+    outlier_rejection: true
+    outlier_threshold_imu: 15.09
+    outlier_threshold_enc: 11.34
+    adaptive.imu: true
+    adaptive.encoder: true
+    adaptive.gnss: false
+    adaptive.window: 50
+    adaptive.alpha: 0.01
+    adaptive.ground_constraint: true
+
+    # ── UKF process noise ────────────────────────────────────────────────────
+    ukf.q_position: 0.01
+    ukf.q_orientation: 1.0e-9
+    ukf.q_velocity: 0.1
+    ukf.q_angular_vel: 0.1
+    ukf.q_acceleration: 1.0
+    ukf.q_gyro_bias: 1.0e-5
+    ukf.q_accel_bias: 1.0e-5
+    ukf.q_encoder_wz_bias: 1.0e-7
+
+    # No GPS: the filter starts at the origin (the charging station) on every boot
+    reference.use_first_fix: false
+    reference.x: 0.0
+    reference.y: 0.0
+    reference.z: 0.0

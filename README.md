@@ -1,7 +1,7 @@
 # 🚜 OmniMow Autonomous Lawn Mower
 
 # Status & Pipelines
-[![Status: ALPHA](https://img.shields.io/badge/Status-ALPHA-red.svg)](#) [![Build OmniMow Containers](https://github.com/Ragsie/OmniMow/actions/workflows/docker_build.yml/badge.svg)](https://github.com/Ragsie/OmniMow/actions/workflows/docker_build.yml) [![ROS 2](https://img.shields.io/badge/ROS_2-Humble-blue?logo=ros)](https://docs.ros.org/en/humble/index.html) [![Wiki Docs](https://img.shields.io/badge/Docs-Wiki-blue?logo=github)](https://github.com/Ragsie/OmniMow/wiki) [![OmniMow Code Quality and Static Analysis](https://github.com/Ragsie/OmniMow/actions/workflows/code_check.yml/badge.svg)](https://github.com/Ragsie/OmniMow/actions/workflows/code_check.yml)
+[![Status: ALPHA](https://img.shields.io/badge/Status-ALPHA-red.svg)](#) [![Build OmniMow Containers](https://github.com/Ragsie/OmniMow/actions/workflows/docker_build.yml/badge.svg)](https://github.com/Ragsie/OmniMow/actions/workflows/docker_build.yml) [![ROS 2](https://img.shields.io/badge/ROS_2-Jazzy-blue?logo=ros)](https://docs.ros.org/en/jazzy/index.html) [![Wiki Docs](https://img.shields.io/badge/Docs-Wiki-blue?logo=github)](https://github.com/Ragsie/OmniMow/wiki) [![OmniMow Code Quality and Static Analysis](https://github.com/Ragsie/OmniMow/actions/workflows/code_check.yml/badge.svg)](https://github.com/Ragsie/OmniMow/actions/workflows/code_check.yml)
 
 # Packaged Containers (GHCR)
 [![GHCR Stereo Vision](https://img.shields.io/badge/GHCR-stereo__vision-blue?logo=github&logoColor=white)](https://github.com/Ragsie/OmniMow/pkgs/container/omnimow%2Fstereo_vision) [![GHCR Depth Fusion](https://img.shields.io/badge/GHCR-depth__fusion-blue?logo=github&logoColor=white)](https://github.com/Ragsie/OmniMow/pkgs/container/omnimow%2Fdepth_fusion) [![GHCR Docking Control](https://img.shields.io/badge/GHCR-docking__control-blue?logo=github&logoColor=white)](https://github.com/Ragsie/OmniMow/pkgs/container/omnimow%2Fdocking_control) [![GHCR App Backend](https://img.shields.io/badge/GHCR-app__backend-blue?logo=github&logoColor=white)](https://github.com/Ragsie/OmniMow/pkgs/container/omnimow%2Fapp_backend) [![GHCR ROSBridge](https://img.shields.io/badge/GHCR-rosbridge__websocket-blue?logo=github&logoColor=white)](https://github.com/Ragsie/OmniMow/pkgs/container/omnimow%2Frosbridge_websocket)
@@ -22,12 +22,12 @@ This project started from frustration: my current Worx M600 Plus has a habit of 
 I’ll document the whole journey here. If you have a mower that is tearing up your lawn too, I hope this project can serve as inspiration for your own build.
 
 ### 🤖 OmniMow Architecture
-An advanced, fully autonomous lawn mower built on a Worx Landroid chassis. This project upgrades the original hardware with a modern ROS 2 (Humble/Jazzy) stack, VESC motor controllers, and real-time depth and AI vision using a YOLO26n-seg model retrained on my own dataset for maximum safety.
+An advanced, fully autonomous lawn mower built on a Worx Landroid chassis. This project upgrades the original hardware with a modern ROS 2 Jazzy (Ubuntu 24.04) stack, VESC motor controllers, and real-time depth and AI vision using a YOLO26n-seg model retrained on my own dataset for maximum safety.
 
 #### 🌟 Features
 * **ROS 2 Nav2:** Dynamic path planning and obstacle avoidance.
 * **AI Vision:** Real-time object detection for humans, pets, and custom-trained objects such as toys or animal waste, triggering immediate emergency stops.
-* **Depth Vision:** A stereo camera providing visual navigation data to the mower, working in tandem with AI vision.
+* **Depth Vision & Visual SLAM:** A calibrated stereo camera (auto-calibration on first boot) provides depth, obstacle detection and RTAB-Map localization against landmarks in the garden - no GPS required.
 * **VESC Motor Control:** Smooth and powerful control of the drive wheels over CAN bus.
 * **Micro-ROS:** Seamless communication between the main computer and the ESP32 drive controllers.
 * **100% Dockerized:** The entire brain of the system—ROS 2, AI, and sensor nodes—runs in isolated Docker containers for reliability and fast startup.
@@ -52,8 +52,7 @@ While the original OpenMower project by Clemens Elflein is primarily designed to
 The plan is to strip all the original electronics from a Worx lawn mower chassis and rebuild it completely from scratch using:
 * **Radxa Dragon Q6A** (main computer with hardware NPU acceleration)
 * **ESP32** & **Autoro VESC 6.7 ESCs** (drive and cutter motor control)
-* **Quectel LC29H** (budget-friendly, millimeter-precise RTK-GNSS)
-* **8MP IMX219 Binocular Camera** (real-time AI vision and emergency stop)
+* **8MP IMX219 Binocular Camera** (real-time AI vision, emergency stop and visual SLAM localization - no GPS needed)
 
 This makes our hardware platform extremely affordable, highly accessible, and fully independent of proprietary hardware manufacturers.
 
