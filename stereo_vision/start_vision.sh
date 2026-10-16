@@ -3,6 +3,7 @@
 # First boot (or after "recalibrate"): run the stereo calibration until it succeeds,
 # then start the stereo node with the rectified pipeline.
 export OMNIMOW_CALIB_DIR=${OMNIMOW_CALIB_DIR:-/calibration}
+# shellcheck source=/dev/null
 source /opt/ros/jazzy/setup.bash
 
 while [ ! -f "$OMNIMOW_CALIB_DIR/left.yaml" ] || [ ! -f "$OMNIMOW_CALIB_DIR/right.yaml" ]; do
