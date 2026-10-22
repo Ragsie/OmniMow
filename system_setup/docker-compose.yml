@@ -166,6 +166,20 @@ services:
     environment:
       - ROS_DOMAIN_ID=1
 
+  # Live video for the app: left camera + AI detections over WebRTC - port 8889 (ws://<ip>:8889/webrtc)
+  video_stream:
+    build:
+      context: ../video_stream
+      dockerfile: Dockerfile
+    container_name: omnimow_video_stream
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    env_file:
+      - ./omnimow.env
+    environment:
+      - ROS_DOMAIN_ID=1
+
   # Docking controller owns the Nav2 staging approach and final charging-contact detection.
   docking_control:
     build:
