@@ -32,9 +32,9 @@ jobs:
     - name: Python Static Analysis (flake8)
       run: |
         # Stop pipeline on syntax errors or undefined variables in active Python modules
-        flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ video_stream/ --count --select=E9,F63,F7,F82 --show-source --statistics
         # Warnings and style checks (Remaining codebase)
-        flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ video_stream/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
     - name: C++ Firmware Analysis (cppcheck)
       run: |
