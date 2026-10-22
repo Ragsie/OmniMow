@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [stereo_vision, depth_fusion, docking_control, app_backend, rosbridge_websocket]
+        service: [stereo_vision, depth_fusion, docking_control, app_backend, rosbridge_websocket, video_stream]
     steps:
     - name: Checkout source code
       uses: actions/checkout@v4
