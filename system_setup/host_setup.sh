@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OmniMow one-click installer for the Radxa Dragon Q6A (Qualcomm QCS6490) - TEST SETUP.
+# OmniMow one-click installer for the Radxa Dragon Q6A (Qualcomm QCS6490)
 #
 # Prepares the host and starts the whole ROS 2 stack in Docker. The stack runs without the ESP32s;
 # the micro-ROS agents are started as well once both ESP32s are connected and their udev serials
