@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# OmniMow AI model updater: installs the model attached to the newest GitHub release.
+# OmniMow AI model updater: installs the model attached to the newest GitHub release that has one.
 #
 # Runs from a systemd timer (omnimow-model-update.timer, set up by host_setup.sh) shortly after
 # boot and then every OMNIMOW_MODEL_CHECK_MIN minutes. When the newest release of
-# OMNIMOW_MODEL_REPO carries a newer OMNIMOW_MODEL_ASSET than the installed one, it is downloaded
+# OMNIMOW_MODEL_REPO with an OMNIMOW_MODEL_ASSET file carries a newer one than the installed one
+# (software releases without a model are skipped), it is downloaded
 # and swapped in atomically. depth_fusion notices the new file and reloads it without a restart;
 # if the new model fails to load, the running one is kept. The replaced model stays as *.previous.
 #
@@ -15,39 +16,44 @@
 # /etc/omnimow/github_token (chmod 600).
 set -euo pipefail
 
-ENV_FILE=/etc/omnimow/omnimow.env
-if [ -f "$ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-    set +a
-fi
-REPO="${OMNIMOW_MODEL_REPO:-Ragsie/testing}"
+# hardware.env (host_setup.sh) names the model that suits this hardware (.bin NPU / .onnx CPU)
+for env_file in /etc/omnimow/omnimow.env /etc/omnimow/hardware.env; do
+    if [ -f "$env_file" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "$env_file"
+        set +a
+    fi
+done
+REPO="${OMNIMOW_MODEL_REPO:-Ragsie/OmniMow}"
 ASSET="${OMNIMOW_MODEL_ASSET:-MowerAIn_seg_htp_context.bin}"
-MODEL_FILE=/opt/omnimow/models/MowerAIn_seg_htp_context.bin
+MODEL_FILE="/opt/omnimow/models/$ASSET"
 VERSION_FILE=/opt/omnimow/models/model_version.json
 TOKEN_FILE=/etc/omnimow/github_token
 
 auth=()
 [ -s "$TOKEN_FILE" ] && auth=(-H "Authorization: Bearer $(tr -d '[:space:]' < "$TOKEN_FILE")")
 
-release=$(curl -fsSL --retry 3 "${auth[@]}" -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/$REPO/releases/latest") || {
-    echo "Could not read the latest release of $REPO (no network, no release yet, or a private repository without $TOKEN_FILE)"
+releases=$(curl -fsSL --retry 3 "${auth[@]}" -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/$REPO/releases?per_page=50") || {
+    echo "Could not read the releases of $REPO (no network, or a private repository without $TOKEN_FILE)"
     exit 1
 }
 
-# Tag, asset id/update time (also catches a model replaced within the same release) and API URL
+# Newest published release with the model: tag, asset id/update time (also catches a model
+# replaced within the same release) and API URL. The list is sorted newest first.
 read -r tag asset_key asset_url < <(python3 -c '
 import json, sys
-release = json.load(sys.stdin)
-for a in release.get("assets", []):
-    if a["name"] == sys.argv[1]:
-        print(release["tag_name"], str(a["id"]) + "-" + a["updated_at"], a["url"])
-        break
-' "$ASSET" <<< "$release") || true
+for release in json.load(sys.stdin):
+    if release.get("draft") or release.get("prerelease"):
+        continue
+    for a in release.get("assets", []):
+        if a["name"] == sys.argv[1]:
+            print(release["tag_name"], str(a["id"]) + "-" + a["updated_at"], a["url"])
+            sys.exit(0)
+' "$ASSET" <<< "$releases") || true
 if [ -z "${tag:-}" ]; then
-    echo "The latest release of $REPO has no $ASSET attached"
+    echo "No release of $REPO has $ASSET attached"
     exit 1
 fi
 

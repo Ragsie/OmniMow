@@ -379,6 +379,7 @@ class BackendROSNode(Node):
     def build_status(self):
         return {
             "calibration": read_calibration_status(),  # Stereo calibration (first boot)
+            "software_update": read_software_status(),  # New release on GitHub (update_software.sh)
             "battery": {
                 "voltage": round(self.battery_v, 2),
                 "percentage": round(self.battery_pct, 1),
@@ -441,6 +442,23 @@ def read_calibration_status():
             pass
     if not os.path.exists(os.path.join(CALIBRATION_DIR, "left.yaml")) and status["state"] == "done":
         status["state"] = "recalibration_requested"
+    return status
+
+
+SOFTWARE_STATUS_FILE = "/opt/omnimow/software_update.json"
+SOFTWARE_UPDATE_REQUEST = "/opt/omnimow/update_request"
+SOFTWARE_CHECK_REQUEST = "/opt/omnimow/check_request"
+
+
+def read_software_status():
+    """Newest release and update progress, written by system_setup/update_software.sh on the host."""
+    try:
+        with open(SOFTWARE_STATUS_FILE) as f:
+            status = json.load(f)
+    except (OSError, ValueError):
+        return {"state": "unknown", "available": False}
+    if os.path.exists(SOFTWARE_UPDATE_REQUEST) and status.get("state") != "installing":
+        status.update({"state": "requested", "message": "Update starts in a moment"})
     return status
 
 
@@ -581,6 +599,34 @@ async def restart_calibration():
     if not moved:
         return {"success": False, "message": "No calibration to replace - calibration is already running"}
     return {"success": True, "message": "Hold the checkerboard in front of the cameras - calibration starts in a few seconds"}
+
+
+@app.get("/api/software")
+async def get_software():
+    return read_software_status()
+
+
+@app.post("/api/software/check")
+async def check_software():
+    # The host's omnimow-software-update.path runs update_software.sh --request
+    open(SOFTWARE_CHECK_REQUEST, "w").close()
+    return {"success": True, "message": "Looking for a new version"}
+
+
+@app.post("/api/software/update")
+async def install_software():
+    # Only while the mower stands still: the update restarts all services, this one too
+    node = getattr(app.state, "ros_node", None)
+    if node is not None and (node.mission.get("active", False) or node.state in (1, 2, 7)):
+        return {"success": False, "message": "The mower is busy - stop it or wait until it is docked"}
+    status = read_software_status()
+    if status.get("state") in ("installing", "requested"):
+        return {"success": False, "message": "An update is already being installed"}
+    if not status.get("available", False):
+        return {"success": False, "message": "No new version to install"}
+    open(SOFTWARE_UPDATE_REQUEST, "w").close()
+    return {"success": True,
+            "message": f"Installing {status.get('latest', 'the new version')} - the app reconnects when the mower is back"}
 
 
 @app.websocket("/ws")

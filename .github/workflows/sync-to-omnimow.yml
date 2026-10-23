@@ -1,0 +1,158 @@
+name: Sync to OmniMow
+
+# Carries the changes made here (the development repository) over to Ragsie/OmniMow as a pull
+# request. Start it under Actions -> Sync to OmniMow -> Run workflow.
+#
+# The two repositories have no common git history, so the changes are moved as a patch: everything
+# that changed in this repository since the last sync (the tag omnimow-sync, or "since") is applied
+# to OmniMow's main with a three-way merge. Files that OmniMow changed on its own (e.g. video_stream
+# in docker-compose.yml) keep those changes; where both changed the same lines, the pull request is
+# opened as a draft with conflict markers in those files, listed in its description.
+#
+# Needs the secret OMNIMOW_TOKEN: a fine-grained token for Ragsie/OmniMow with Contents, Pull requests
+# and Workflows read and write (Workflows because files in .github/workflows are carried over too).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit here to carry over"
+        default: main
+        required: true
+      since:
+        description: "Carry over the changes after this commit (empty: since the last sync, tag omnimow-sync)"
+        required: false
+      target:
+        description: "Repository to carry them to"
+        default: Ragsie/OmniMow
+        required: true
+
+permissions:
+  contents: write   # moves the omnimow-sync tag here
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout this repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+        path: source
+
+    - name: Make the patch
+      id: patch
+      working-directory: source
+      env:
+        SINCE: ${{ inputs.since }}
+      run: |
+        git fetch --tags --force
+        base="${SINCE:-$(git rev-parse -q --verify 'refs/tags/omnimow-sync^{commit}' || true)}"
+        if [ -z "$base" ]; then
+          echo "::error::No earlier sync (tag omnimow-sync). Enter the commit to start from in 'since'."
+          exit 1
+        fi
+        base=$(git rev-parse "$base^{commit}")
+        head=$(git rev-parse HEAD)
+        # This workflow only belongs here
+        git diff --binary --full-index "$base" "$head" -- . ':!.github/workflows/sync-to-omnimow.yml' > ../changes.patch
+        if [ ! -s ../changes.patch ]; then
+          echo "Nothing changed since $(git rev-parse --short "$base")"
+          echo "empty=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        git log --no-merges --format='* %s (%h)' "$base..$head" > ../commits.md
+        git diff --stat "$base" "$head" -- . ':!.github/workflows/sync-to-omnimow.yml' > ../stat.txt
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+        echo "head=$head" >> "$GITHUB_OUTPUT"
+        echo "short=$(git rev-parse --short "$head")" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout ${{ inputs.target }}
+      if: steps.patch.outputs.empty != 'true'
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.target }}
+        token: ${{ secrets.OMNIMOW_TOKEN }}
+        fetch-depth: 0
+        path: target
+
+    - name: Apply the changes on a new branch
+      if: steps.patch.outputs.empty != 'true'
+      id: apply
+      working-directory: target
+      env:
+        BASE: ${{ steps.patch.outputs.base }}
+        SHORT: ${{ steps.patch.outputs.short }}
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        branch="sync/testing-$SHORT"
+        git checkout -b "$branch"
+        # The three-way merge needs the files as they were at the last sync: fetch them from here
+        git fetch --quiet ../source "$BASE"
+        conflicts=""
+        if ! git apply --3way --whitespace=nowarn ../changes.patch; then
+          conflicts=$(git diff --name-only --diff-filter=U)
+          if [ -z "$conflicts" ]; then
+            echo "::error::The changes could not be applied (see the log above)"
+            exit 1
+          fi
+        fi
+        git add -A
+        if git diff --cached --quiet; then
+          echo "OmniMow already has these changes"
+          echo "nothing=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        git commit -q -m "Sync from Ragsie/testing ${SHORT}" -m "$(cat ../commits.md)"
+        git push -q origin "$branch"
+        echo "branch=$branch" >> "$GITHUB_OUTPUT"
+        {
+          echo "conflicts<<EOF"
+          echo "$conflicts"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Open the pull request
+      if: steps.patch.outputs.empty != 'true' && steps.apply.outputs.nothing != 'true'
+      working-directory: target
+      env:
+        GH_TOKEN: ${{ secrets.OMNIMOW_TOKEN }}
+        BRANCH: ${{ steps.apply.outputs.branch }}
+        CONFLICTS: ${{ steps.apply.outputs.conflicts }}
+        SHORT: ${{ steps.patch.outputs.short }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        {
+          echo "Changes from \`Ragsie/testing\` (${{ inputs.ref }} at \`$SHORT\`) since the last sync."
+          echo
+          if [ -n "$CONFLICTS" ]; then
+            echo "## ⚠️ Conflicts"
+            echo "Both repositories changed the same lines in these files. They contain conflict markers"
+            echo "(\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`): fix them on this branch before merging."
+            echo
+            echo "$CONFLICTS" | sed 's/^/* `/; s/$/`/'
+            echo
+          fi
+          echo "## Commits"
+          cat ../commits.md
+          echo
+          echo "## Files"
+          echo '```'
+          cat ../stat.txt
+          echo '```'
+        } > ../body.md
+        draft=()
+        [ -n "$CONFLICTS" ] && draft=(--draft)
+        gh pr create --repo "$TARGET" --base main --head "$BRANCH" "${draft[@]}" \
+          --title "Sync from testing ($SHORT)" --body-file ../body.md
+
+    - name: Remember the sync
+      if: steps.patch.outputs.empty != 'true' && steps.apply.outputs.nothing != 'true'
+      working-directory: source
+      env:
+        HEAD_SHA: ${{ steps.patch.outputs.head }}
+      run: |
+        # The next run carries over only what changed after this one
+        git tag -f omnimow-sync "$HEAD_SHA"
+        git push -f origin refs/tags/omnimow-sync

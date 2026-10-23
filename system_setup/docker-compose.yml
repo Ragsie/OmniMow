@@ -1,4 +1,4 @@
-# OmniMow on Radxa Dragon Q6A - Ubuntu 24.04 / ROS 2 Jazzy.
+# OmniMow on Radxa Dragon Q6A or an x86 mini PC - Ubuntu 24.04 / ROS 2 Jazzy.
 # All services share ROS_DOMAIN_ID=1 over the host network.
 
 services:
@@ -16,9 +16,12 @@ services:
     volumes:
       - /dev/shm:/dev/shm  # Shared memory lets the stereo node exchange camera data efficiently
       - /run/udev:/run/udev:ro
+      - /dev/v4l:/dev/v4l:ro  # USB cameras by port (/dev/v4l/by-path), see hardware.env
       - /opt/omnimow/calibration:/calibration  # Stereo calibration (created on first boot)
     env_file:
       - ./omnimow.env
+      - path: /etc/omnimow/hardware.env  # found by host_setup.sh: platform, cameras, model
+        required: false
     environment:
       - ROS_DOMAIN_ID=1
 
@@ -86,6 +89,8 @@ services:
       - /dev/log:/dev/log   # FastRPC logs to syslog: its messages land in the host journal
     env_file:
       - ./omnimow.env
+      - path: /etc/omnimow/hardware.env  # found by host_setup.sh: platform, cameras, model
+        required: false
     environment:
       - ROS_DOMAIN_ID=1
 
@@ -102,6 +107,8 @@ services:
       - /opt/omnimow/maps:/maps  # rtabmap.db - the map of the garden, kept between boots
     env_file:
       - ./omnimow.env
+      - path: /etc/omnimow/hardware.env  # found by host_setup.sh: platform, cameras, model
+        required: false
     environment:
       - ROS_DOMAIN_ID=1
 
@@ -119,6 +126,8 @@ services:
       - ./localization:/config:ro
     env_file:
       - ./omnimow.env
+      - path: /etc/omnimow/hardware.env  # found by host_setup.sh: platform, cameras, model
+        required: false
     environment:
       - ROS_DOMAIN_ID=1
     # The image's entrypoint sources ROS + the FusionCore workspace, then runs this
@@ -135,6 +144,8 @@ services:
     ipc: host
     env_file:
       - ./omnimow.env
+      - path: /etc/omnimow/hardware.env  # found by host_setup.sh: platform, cameras, model
+        required: false
     environment:
       - ROS_DOMAIN_ID=1
 
@@ -150,6 +161,8 @@ services:
       - /opt/omnimow:/opt/omnimow  # zones.json and mowing_progress.json
     env_file:
       - ./omnimow.env
+      - path: /etc/omnimow/hardware.env  # found by host_setup.sh: platform, cameras, model
+        required: false
     environment:
       - ROS_DOMAIN_ID=1
 
@@ -166,20 +179,6 @@ services:
     environment:
       - ROS_DOMAIN_ID=1
 
-  # Live video for the app: left camera + AI detections over WebRTC - port 8889 (ws://<ip>:8889/webrtc)
-  video_stream:
-    build:
-      context: ../video_stream
-      dockerfile: Dockerfile
-    container_name: omnimow_video_stream
-    restart: unless-stopped
-    network_mode: host
-    ipc: host
-    env_file:
-      - ./omnimow.env
-    environment:
-      - ROS_DOMAIN_ID=1
-
   # Docking controller owns the Nav2 staging approach and final charging-contact detection.
   docking_control:
     build:
@@ -190,5 +189,7 @@ services:
     network_mode: host
     env_file:
       - ./omnimow.env
+      - path: /etc/omnimow/hardware.env  # found by host_setup.sh: platform, cameras, model
+        required: false
     environment:
       - ROS_DOMAIN_ID=1

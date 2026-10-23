@@ -13,9 +13,11 @@ pairs the newest left and right frames whose timestamps are close together.
 
 Settings (omnimow.env):
   OMNIMOW_CAMERA_BACKEND             libcamera (default), gstreamer (v4l2src on /dev/videoN) or
-                                     v4l2 (plain OpenCV capture, e.g. USB cameras)
+                                     v4l2 (plain OpenCV capture, e.g. USB cameras); host_setup.sh
+                                     replaces auto with what it found (/etc/omnimow/hardware.env)
   OMNIMOW_CAMERA_ID_LEFT/RIGHT       libcamera IDs, e.g. /base/soc@0/cci@ac4b000/i2c-bus@1/camera@10
-  OMNIMOW_CAMERA_DEVICE_LEFT/RIGHT   /dev/video2, /dev/video3 (gstreamer / v4l2 backends)
+  OMNIMOW_CAMERA_DEVICE_LEFT/RIGHT   /dev/video2, /dev/video3 or /dev/v4l/by-path/... (gstreamer /
+                                     v4l2 backends)
   OMNIMOW_CAMERA_SENSOR_WIDTH/HEIGHT format requested from the camera (1920 x 1080), not used with
                                      OMNIMOW_CAMERA_GPU_SCALE
   OMNIMOW_CAMERA_GPU_SCALE           true: libcamera's GPU debayer (LIBCAMERA_SOFTISP_MODE=gpu) delivers
@@ -58,7 +60,8 @@ def upside_down():
 
 
 def backend():
-    return os.getenv('OMNIMOW_CAMERA_BACKEND', 'libcamera').lower()
+    value = os.getenv('OMNIMOW_CAMERA_BACKEND', 'libcamera').lower()
+    return 'libcamera' if value in ('', 'auto') else value
 
 
 def default_cameras():
@@ -66,8 +69,9 @@ def default_cameras():
     if backend() == 'libcamera':
         return (os.getenv('OMNIMOW_CAMERA_ID_LEFT', DEFAULT_CAMERA_ID_LEFT),
                 os.getenv('OMNIMOW_CAMERA_ID_RIGHT', DEFAULT_CAMERA_ID_RIGHT))
-    return (os.getenv('OMNIMOW_CAMERA_DEVICE_LEFT', '/dev/video2'),
-            os.getenv('OMNIMOW_CAMERA_DEVICE_RIGHT', '/dev/video3'))
+    # /dev/v4l/by-path links (USB port) point to the /dev/videoN the camera has on this boot
+    return (os.path.realpath(os.getenv('OMNIMOW_CAMERA_DEVICE_LEFT') or '/dev/video2'),
+            os.path.realpath(os.getenv('OMNIMOW_CAMERA_DEVICE_RIGHT') or '/dev/video3'))
 
 
 def gpu_scale():
