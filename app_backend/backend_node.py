@@ -452,11 +452,24 @@ SOFTWARE_CHECK_REQUEST = "/opt/omnimow/check_request"
 
 def read_software_status():
     """Newest release and update progress, written by system_setup/update_software.sh on the host."""
+    # The host's omnimow-software-update.path removes a request within seconds. One that stays means
+    # nothing on the host picks it up (or the request file never reaches the host)
+    for request, what in ((SOFTWARE_UPDATE_REQUEST, "update"), (SOFTWARE_CHECK_REQUEST, "check")):
+        try:
+            waiting = time.time() - os.path.getmtime(request)
+        except OSError:
+            continue
+        if waiting > 60:
+            return {"state": "error", "available": False,
+                    "message": f"The mower did not start the {what} for {int(waiting)} s - on the mower, check "
+                               "'systemctl status omnimow-software-update.path' and run "
+                               "'sudo omnimow-update-software --check'"}
     try:
         with open(SOFTWARE_STATUS_FILE) as f:
             status = json.load(f)
     except (OSError, ValueError):
-        return {"state": "unknown", "available": False}
+        return {"state": "unknown", "available": False,
+                "message": "The mower has not checked for updates yet (no " + SOFTWARE_STATUS_FILE + ")"}
     if os.path.exists(SOFTWARE_UPDATE_REQUEST) and status.get("state") != "installing":
         status.update({"state": "requested", "message": "Update starts in a moment"})
     return status
