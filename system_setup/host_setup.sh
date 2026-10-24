@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# OmniMow one-click installer for the Radxa Dragon Q6A (Qualcomm QCS6490)
+# OmniMow one-click installer for the Radxa Dragon Q6A (Qualcomm QCS6490) - TEST SETUP.
 #
 # Prepares the host and starts the whole ROS 2 stack in Docker. The stack runs without the ESP32s;
 # the micro-ROS agents are started as well once both ESP32s are connected and their udev serials
 # are set. To leave the board's RAM, CPU and disk to the stack, the host is trimmed: it boots
-# without the desktop (GNOME stays installed, OMNIMOW_DESKTOP=true in omnimow.env brings it back),
+# without the desktop (GNOME stays installed, OMNIMOW_DESKTOP=true in robot.env brings it back),
 # services the mower does not use are switched off, and unused packages are deleted after the build.
 # Security updates keep installing themselves, and the Docker build cache is kept for fast rebuilds.
 #
@@ -16,7 +16,11 @@
 # /etc/omnimow/hardware.env, which the containers read after omnimow.env.
 #
 # Tested images: rafaelwms/ubuntu-26.04.1-dragon-q6a (mainline kernel, FastRPC preinstalled),
-# Radxa OS (Ubuntu 24.04). Safe to run again, e.g. after changing omnimow.env.
+# Radxa OS (Ubuntu 24.04). Safe to run again, e.g. after changing robot.env.
+#
+# Settings: omnimow.env holds the defaults (Worx Landroid M600 Plus) and is replaced by software
+# updates. This mower's own values go in /etc/omnimow/robot.env, which updates never touch: on
+# the first install from a terminal, configure_robot.sh asks for the robot's measurements.
 #
 # From a clone of the repository:
 #   sudo bash system_setup/host_setup.sh [--model FILE.bin] [--reboot]
@@ -28,6 +32,7 @@
 #                  up to date automatically (update_model.sh, OMNIMOW_MODEL_* in omnimow.env).
 #                  The file type must suit the hardware: .bin on the Radxa NPU, .onnx elsewhere.
 #   --reboot       reboot when done (needed once for new groups and the camera overlay)
+#   --configure    ask for the robot's measurements again (configure_robot.sh)
 #   --user NAME    account to set up (default: found automatically - the one that ran sudo)
 set -e
 
@@ -46,11 +51,13 @@ fi
 MODEL_SRC=""
 REBOOT=false
 TARGET_USER=""
+CONFIGURE=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --model)  MODEL_SRC="$2"; shift 2 ;;
         --reboot) REBOOT=true; shift ;;
         --user)   TARGET_USER="$2"; shift 2 ;;
+        --configure) CONFIGURE=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -115,6 +122,7 @@ if [ ! -f "$SCRIPT_DIR/docker-compose.yml" ]; then
     args=(--user "$TARGET_USER")
     [ -n "$MODEL_SRC" ] && args+=(--model "$MODEL_SRC")
     [ "$REBOOT" = true ] && args+=(--reboot)
+    [ "$CONFIGURE" = true ] && args+=(--configure)
     exec bash "$REPO_DIR/system_setup/host_setup.sh" "${args[@]}" < /dev/null
 fi
 
@@ -142,13 +150,30 @@ install_available() {
 # ---------------------------------------------------------
 step "1/9 Configuration"
 ENV_FILE="$SCRIPT_DIR/omnimow.env"
+ROBOT_ENV=/etc/omnimow/robot.env
 mkdir -p /etc/omnimow
 ln -sf "$ENV_FILE" /etc/omnimow/omnimow.env
+# Values changed by hand in omnimow.env (or merged into it by an older software update) move to
+# robot.env, so the next update can replace omnimow.env
+bash "$SCRIPT_DIR/configure_robot.sh" --migrate || warn "could not move your changes in omnimow.env to $ROBOT_ENV"
+# The robot's measurements: asked once, on the first install from a terminal (also when piped
+# from curl). Without a terminal (software update, cloud-init) the defaults stay.
+if [ "$CONFIGURE" = true ] || [ ! -f "$ROBOT_ENV" ]; then
+    if { : < /dev/tty; } 2> /dev/null; then
+        bash "$SCRIPT_DIR/configure_robot.sh" < /dev/tty > /dev/tty 2>&1
+    elif [ ! -f "$ROBOT_ENV" ]; then
+        echo "No terminal: using the defaults of omnimow.env (Worx Landroid). Own robot: sudo bash $SCRIPT_DIR/host_setup.sh --configure"
+    fi
+fi
 set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"
+if [ -f "$ROBOT_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$ROBOT_ENV"
+fi
 set +a
-echo "Using $ENV_FILE; setting up user account '$TARGET_USER' ($TARGET_HOME)"
+echo "Using $ENV_FILE$([ -f "$ROBOT_ENV" ] && echo " and $ROBOT_ENV"); setting up user account '$TARGET_USER' ($TARGET_HOME)"
 
 # Hardware: radxa (Dragon Q6A, NPU), pi or x86 (AI on the CPU), generic (other boards, as x86)
 platform="${OMNIMOW_PLATFORM:-auto}"
@@ -197,7 +222,7 @@ fi
 echo "Cameras: $camera_backend (USB cameras found: ${#usb_cams[@]})"
 {
     echo "# Written by host_setup.sh from the hardware it found - do not edit, set the values in"
-    echo "# omnimow.env instead (they are only found automatically while set to auto there)."
+    echo "# robot.env instead (they are only found automatically while set to auto there)."
     echo "OMNIMOW_PLATFORM=$platform"
     echo "OMNIMOW_CAMERA_BACKEND=$camera_backend"
     echo "OMNIMOW_MODEL_ASSET=$model_asset"
@@ -341,7 +366,7 @@ elif [ "${OMNIMOW_DESKTOP:-false}" = true ]; then
     echo "Desktop on (OMNIMOW_DESKTOP=true)"
 else
     systemctl set-default multi-user.target
-    echo "Desktop off from the next boot (log in over SSH; OMNIMOW_DESKTOP=true in omnimow.env to keep it)"
+    echo "Desktop off from the next boot (log in over SSH; OMNIMOW_DESKTOP=true in robot.env to keep it)"
 fi
 
 # Services the mower does not use. ModemManager also probes new serial ports and gets in the way of
@@ -548,6 +573,8 @@ systemctl daemon-reload
 systemctl enable omnimow-software-check.timer omnimow-software-update.path
 systemctl restart omnimow-software-check.timer
 # Not restarted: when the app started this run, the update service is running it right now
+# A path unit that hit its start limit (requests that failed again and again) stays off until reset
+systemctl reset-failed omnimow-software-update.path omnimow-software-update.service 2> /dev/null || true
 systemctl start omnimow-software-update.path
 touch /opt/omnimow/check_request   # status for the app right away (after the update, if one runs)
 

@@ -5,8 +5,9 @@
 # of OMNIMOW_SOFTWARE_REPO. A release is made from main on GitHub (see .github/workflows/release.yml).
 # The result goes to /opt/omnimow/software_update.json, which app_backend sends to the app. When the
 # user taps "Update" in the app, app_backend writes /opt/omnimow/update_request, and
-# omnimow-software-update.path runs this script: the release is checked out, the user's changes
-# in omnimow.env are carried over, and host_setup.sh rebuilds and restarts what changed.
+# omnimow-software-update.path runs this script: the release is checked out and host_setup.sh
+# rebuilds and restarts what changed. The mower's own settings are in /etc/omnimow/robot.env,
+# outside the repository, so the release's omnimow.env (the defaults) can simply replace the old one.
 #
 #   update_software.sh --check      look for a newer release (omnimow-software-check.timer)
 #   update_software.sh --install    install the newest release
@@ -17,12 +18,15 @@
 set -euo pipefail
 
 ENV_FILE=/etc/omnimow/omnimow.env
-if [ -f "$ENV_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-    set +a
-fi
+# robot.env (configure_robot.sh) after omnimow.env: e.g. OMNIMOW_SOFTWARE_REPO of a fork
+for env_file in "$ENV_FILE" /etc/omnimow/robot.env; do
+    if [ -f "$env_file" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "$env_file"
+        set +a
+    fi
+done
 REPO="${OMNIMOW_SOFTWARE_REPO:-Ragsie/OmniMow}"
 STATUS_FILE=/opt/omnimow/software_update.json
 INSTALL_REQUEST=/opt/omnimow/update_request
@@ -30,11 +34,25 @@ CHECK_REQUEST=/opt/omnimow/check_request
 TOKEN_FILE=/etc/omnimow/github_token
 LOG=/var/log/omnimow-update.log
 
+# A request from the app is taken (removed) first: one left behind after an early error would start
+# omnimow-software-update.path again and again until systemd gives up on it
+mode="${1:---check}"
+if [ "$mode" = --request ]; then
+    if [ -e "$INSTALL_REQUEST" ]; then
+        mode=--install
+    elif [ -e "$CHECK_REQUEST" ]; then
+        mode=--check
+    else
+        exit 0
+    fi
+    rm -f "$INSTALL_REQUEST" "$CHECK_REQUEST"
+fi
+
 # The repository host_setup.sh ran from: /etc/omnimow/omnimow.env links to its system_setup folder
 REPO_DIR="$(dirname "$(dirname "$(readlink -f "$ENV_FILE")")")"
-if [ ! -d "$REPO_DIR/.git" ]; then
+if [ ! -e "$REPO_DIR/.git" ]; then
     # E.g. installed from a downloaded zip: tell the app why there are no updates
-    message="$REPO_DIR is not a git clone - install from a clone (git clone) to get updates from the app"
+    message="$REPO_DIR is not a git clone (no .git) - install from a clone (git clone https://github.com/$REPO.git) to get updates from the app"
     python3 -c 'import json, sys, time; json.dump({"state": "error", "available": False, "message": sys.argv[2],
 "installed": "unknown", "updated_at": int(time.time())}, open(sys.argv[1], "w"), indent=2)' "$STATUS_FILE" "$message"
     echo "$message"
@@ -116,47 +134,28 @@ check() {
 install() {
     fetch_release
     status installing "Installing $tag - the mower restarts its services when done"
-    env_rel=system_setup/omnimow.env
-    work=$(mktemp -d)
-    trap 'rm -rf "$work"' EXIT
-    # omnimow.env holds the user's settings: keep them and merge the release's new settings in
-    cp "$REPO_DIR/$env_rel" "$work/mine"
-    g show "HEAD:$env_rel" > "$work/base"
-    g checkout --quiet -- "$env_rel"
+    # Changes made by hand in omnimow.env move to robot.env first, so the checkout can replace it
+    if [ -f "$REPO_DIR/system_setup/configure_robot.sh" ]; then
+        bash "$REPO_DIR/system_setup/configure_robot.sh" --migrate >> "$LOG" 2>&1 || {
+            status failed "Could not move the changes in omnimow.env to /etc/omnimow/robot.env - see $LOG"
+            exit 1
+        }
+    fi
     if ! g checkout --quiet --detach "$tag"; then
-        cat "$work/mine" > "$REPO_DIR/$env_rel"
         status failed "Could not check out $tag - local changes in $REPO_DIR? (git status)"
         exit 1
     fi
-    g show "HEAD:$env_rel" > "$work/new"
-    cp "$work/mine" "$work/merged"
-    env_note=""
-    if git merge-file -q "$work/merged" "$work/base" "$work/new"; then
-        cat "$work/merged" > "$REPO_DIR/$env_rel"
-    else
-        # Same lines changed by the user and the release: keep the user's file as it was
-        cat "$work/mine" > "$REPO_DIR/$env_rel"
-        env_note=" - omnimow.env kept as it was, compare it with the release's (git diff $tag)"
-    fi
     echo "=== Installing $tag ($(date)) ===" >> "$LOG"
     if OMNIMOW_FORCE_RECREATE=true bash "$REPO_DIR/system_setup/host_setup.sh" --user "$OWNER" >> "$LOG" 2>&1; then
-        status up_to_date "Version $tag installed$env_note"
+        status up_to_date "Version $tag installed"
     else
-        status failed "Installing $tag failed - see $LOG on the mower$env_note"
+        status failed "Installing $tag failed - see $LOG on the mower"
         exit 1
     fi
 }
 
-case "${1:---check}" in
+case "$mode" in
     --check)   check ;;
     --install) install ;;
-    --request)
-        if [ -e "$INSTALL_REQUEST" ]; then
-            rm -f "$INSTALL_REQUEST" "$CHECK_REQUEST"
-            install
-        elif [ -e "$CHECK_REQUEST" ]; then
-            rm -f "$CHECK_REQUEST"
-            check
-        fi ;;
     *) echo "Usage: $0 [--check | --install | --request]"; exit 1 ;;
 esac

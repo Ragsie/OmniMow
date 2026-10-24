@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # hardware.env (host_setup.sh) names the model that suits this hardware (.bin NPU / .onnx CPU)
-for env_file in /etc/omnimow/omnimow.env /etc/omnimow/hardware.env; do
+for env_file in /etc/omnimow/omnimow.env /etc/omnimow/robot.env /etc/omnimow/hardware.env; do
     if [ -f "$env_file" ]; then
         set -a
         # shellcheck disable=SC1090

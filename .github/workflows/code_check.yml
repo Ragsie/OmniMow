@@ -43,4 +43,4 @@ jobs:
     - name: Shell Script Analysis (shellcheck)
       run: |
         # Static analysis of host setup and startup scripts
-        shellcheck system_setup/host_setup.sh stereo_vision/start_vision.sh
+        shellcheck system_setup/host_setup.sh system_setup/configure_robot.sh stereo_vision/start_vision.sh

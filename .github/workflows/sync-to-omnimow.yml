@@ -7,7 +7,8 @@ name: Sync to OmniMow
 # that changed in this repository since the last sync (the tag omnimow-sync, or "since") is applied
 # to OmniMow's main with a three-way merge. Files that OmniMow changed on its own (e.g. video_stream
 # in docker-compose.yml) keep those changes; where both changed the same lines, the pull request is
-# opened as a draft with conflict markers in those files, listed in its description.
+# opened as a draft with conflict markers in those files, listed in its description. Changes to files
+# OmniMow does not have (deleted or renamed there) are skipped and listed in the description.
 #
 # Needs the secret OMNIMOW_TOKEN: a fine-grained token for Ragsie/OmniMow with Contents, Pull requests
 # and Workflows read and write (Workflows because files in .github/workflows are carried over too).
@@ -54,15 +55,17 @@ jobs:
         fi
         base=$(git rev-parse "$base^{commit}")
         head=$(git rev-parse HEAD)
-        # This workflow only belongs here
-        git diff --binary --full-index "$base" "$head" -- . ':!.github/workflows/sync-to-omnimow.yml' > ../changes.patch
+        # This workflow only belongs here. No rename detection: a rename is a deletion and a new file
+        paths=(-- . ':!.github/workflows/sync-to-omnimow.yml')
+        git diff --no-renames --binary --full-index "$base" "$head" "${paths[@]}" > ../changes.patch
+        git diff --no-renames --name-status "$base" "$head" "${paths[@]}" > ../name-status.txt
         if [ ! -s ../changes.patch ]; then
           echo "Nothing changed since $(git rev-parse --short "$base")"
           echo "empty=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
         git log --no-merges --format='* %s (%h)' "$base..$head" > ../commits.md
-        git diff --stat "$base" "$head" -- . ':!.github/workflows/sync-to-omnimow.yml' > ../stat.txt
+        git diff --stat "$base" "$head" "${paths[@]}" > ../stat.txt
         echo "base=$base" >> "$GITHUB_OUTPUT"
         echo "head=$head" >> "$GITHUB_OUTPUT"
         echo "short=$(git rev-parse --short "$head")" >> "$GITHUB_OUTPUT"
@@ -90,8 +93,17 @@ jobs:
         git checkout -b "$branch"
         # The three-way merge needs the files as they were at the last sync: fetch them from here
         git fetch --quiet ../source "$BASE"
+        # Changed or deleted here, but not in the target (deleted or renamed there): skip
+        skipped=""
+        excludes=()
+        while IFS=$'\t' read -r status path; do
+          if [ "$status" != A ] && [ ! -e "$path" ]; then
+            skipped+="$path"$'\n'
+            excludes+=("--exclude=$path")
+          fi
+        done < ../name-status.txt
         conflicts=""
-        if ! git apply --3way --whitespace=nowarn ../changes.patch; then
+        if ! git apply --3way --whitespace=nowarn "${excludes[@]}" ../changes.patch; then
           conflicts=$(git diff --name-only --diff-filter=U)
           if [ -z "$conflicts" ]; then
             echo "::error::The changes could not be applied (see the log above)"
@@ -111,6 +123,9 @@ jobs:
           echo "conflicts<<EOF"
           echo "$conflicts"
           echo "EOF"
+          echo "skipped<<EOF"
+          printf '%s' "$skipped"
+          echo "EOF"
         } >> "$GITHUB_OUTPUT"
 
     - name: Open the pull request
@@ -120,6 +135,7 @@ jobs:
         GH_TOKEN: ${{ secrets.OMNIMOW_TOKEN }}
         BRANCH: ${{ steps.apply.outputs.branch }}
         CONFLICTS: ${{ steps.apply.outputs.conflicts }}
+        SKIPPED: ${{ steps.apply.outputs.skipped }}
         SHORT: ${{ steps.patch.outputs.short }}
         TARGET: ${{ inputs.target }}
       run: |
@@ -132,6 +148,14 @@ jobs:
             echo "(\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`): fix them on this branch before merging."
             echo
             echo "$CONFLICTS" | sed 's/^/* `/; s/$/`/'
+            echo
+          fi
+          if [ -n "$SKIPPED" ]; then
+            echo "## Skipped"
+            echo "Changed here, but $TARGET does not have these files (deleted or renamed there). Carry the"
+            echo "changes over by hand if they are needed:"
+            echo
+            echo "$SKIPPED" | sed 's/^/* `/; s/$/`/'
             echo
           fi
           echo "## Commits"
