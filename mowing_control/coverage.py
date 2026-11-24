@@ -2,7 +2,7 @@
 """
 Coverage path planning for OmniMow (no ROS dependencies, so it can be tested on a PC).
 
-All coordinates are metres in the local odom frame (x = east, y = north).
+All coordinates are metres in the SLAM map frame (origin: where the map was started, in the dock).
 
 A plan for one zone is:
   1. Perimeter passes along the edge of the lawn and around every exclusion zone (flower beds)

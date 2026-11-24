@@ -5,23 +5,26 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   lint:
+    # In a private repository this only runs when started by hand (Actions -> Run workflow), so
+    # it uses no Actions minutes by itself. Public repositories (free minutes) run it on every push.
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
     - name: Checkout source code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Load OmniMow environment variables from omnimow.env to GitHub Actions
       run: |
         grep -v '^#' system_setup/omnimow.env >> $GITHUB_ENV
       
     - name: Setup Python Environment
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
       with:
         python-version: '3.10'
-        #
 
     - name: Install testing tools and static analyzers
       run: |
@@ -32,9 +35,9 @@ jobs:
     - name: Python Static Analysis (flake8)
       run: |
         # Stop pipeline on syntax errors or undefined variables in active Python modules
-        flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Warnings and style checks (Remaining codebase)
-        flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ video_stream/ mowing_control/ navigation/ slam/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Style warnings only, never fails the build
+        flake8 stereo_vision/ depth_fusion/ docking_control/ app_backend/ video_stream/ mowing_control/ navigation/ slam/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
     - name: C++ Firmware Analysis (cppcheck)
       run: |
@@ -42,5 +45,4 @@ jobs:
 
     - name: Shell Script Analysis (shellcheck)
       run: |
-        # Static analysis of host setup and startup scripts
-        shellcheck system_setup/host_setup.sh system_setup/configure_robot.sh stereo_vision/start_vision.sh
+        shellcheck system_setup/host_setup.sh system_setup/configure_robot.sh system_setup/update_software.sh system_setup/update_model.sh system_setup/reset_esp32.sh system_setup/camera/install_camera_dtb.sh stereo_vision/start_vision.sh

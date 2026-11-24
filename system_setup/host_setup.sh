@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OmniMow one-click installer for the Radxa Dragon Q6A (Qualcomm QCS6490) - TEST SETUP.
+# OmniMow one-click installer for the Radxa Dragon Q6A (Qualcomm QCS6490) and x86 mini PCs.
 #
 # Prepares the host and starts the whole ROS 2 stack in Docker. The stack runs without the ESP32s;
 # the micro-ROS agents are started as well once both ESP32s are connected and their udev serials
@@ -127,7 +127,7 @@ if [ ! -f "$SCRIPT_DIR/docker-compose.yml" ]; then
 fi
 
 exec > >(tee -a "$LOG") 2>&1
-echo "=== OmniMow test setup ($(date)) - log: $LOG ==="
+echo "=== OmniMow setup ($(date)) - log: $LOG ==="
 
 step() { echo ""; echo "=== $* ==="; }
 WARNINGS=()
@@ -499,7 +499,7 @@ systemctl restart omnimow-model-update.timer
 
 case "$MODEL_SRC" in
     "")
-        /usr/local/sbin/omnimow-update-model || warn "no model from the GitHub releases of $OMNIMOW_MODEL_REPO - publish a release with $model_asset (private repository: GitHub token in /etc/omnimow/github_token), or use --model" ;;
+        /usr/local/sbin/omnimow-update-model || warn "no model from the GitHub releases (see above) - publish a release with $model_asset (private repository: GitHub token in /etc/omnimow/github_token), or use --model" ;;
     http://*|https://*)
         echo "Downloading the model: $MODEL_SRC"
         if curl -fL --retry 3 -o "$MODEL_FILE.part" "$MODEL_SRC"; then
@@ -577,6 +577,26 @@ systemctl restart omnimow-software-check.timer
 systemctl reset-failed omnimow-software-update.path omnimow-software-update.service 2> /dev/null || true
 systemctl start omnimow-software-update.path
 touch /opt/omnimow/check_request   # status for the app right away (after the update, if one runs)
+
+# After a software update the mower reboots, and the ESP32s are restarted before the containers
+# start: the drive ESP32's emergency stop locks while the heartbeat is gone (see reset_esp32.sh)
+install -m 755 "$SCRIPT_DIR/reset_esp32.sh" /usr/local/sbin/omnimow-reset-esp32
+tee /etc/systemd/system/omnimow-esp32-reset.service > /dev/null << 'EOF'
+[Unit]
+Description=OmniMow: restart the ESP32s after a software update
+ConditionPathExists=/opt/omnimow/esp32_reset_pending
+After=systemd-udev-trigger.service local-fs.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/omnimow-reset-esp32 --pending
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable omnimow-esp32-reset.service
 
 if [ -n "$OMNIMOW_NFS_SERVER_IP" ]; then
     echo "Training server $OMNIMOW_NFS_SERVER_IP: mounting $OMNIMOW_NFS_SHARE on /opt/omnimow/incoming_raw"

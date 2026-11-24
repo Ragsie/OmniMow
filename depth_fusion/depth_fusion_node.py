@@ -11,6 +11,7 @@ Publishes
 """
 import json
 import os
+import shutil
 import time
 from collections import deque
 
@@ -27,7 +28,7 @@ from std_msgs.msg import Bool, Header, String
 from yolo_seg import class_mask, decode, preprocess
 from npu_model import NpuModel, init_qnn_runtime
 
-CLASS_NAMES = ["dog", "grass", "pavement", "poo", "toy", "tree", "wall"]  # Same order as the training CLASS_MAP
+CLASS_NAMES = ["dog", "grass", "pavement", "poo", "toy", "tree", "wall", "human"]  # Same order as the training CLASS_MAP
 
 
 class DepthFusionNode(Node):
@@ -41,9 +42,9 @@ class DepthFusionNode(Node):
         self.declare_parameter('confidence_threshold', 0.50)
         self.declare_parameter('iou_threshold', 0.45)
         self.declare_parameter('active_learning_threshold', 0.20)  # MLOps: save uncertain images
-        self.declare_parameter('obstacle_classes', [0, 3, 4, 5, 6])  # dog, poo, toy, tree, wall
-        self.declare_parameter('hazard_classes', [0])                # dog -> /vision/hazard
-        self.declare_parameter('active_learning_classes', [0, 3, 4])  # dog, poo, toy
+        self.declare_parameter('obstacle_classes', [0, 3, 4, 5, 6, 7])  # dog, poo, toy, tree, wall, human
+        self.declare_parameter('hazard_classes', [0, 7])                # dog and human -> /vision/hazard
+        self.declare_parameter('active_learning_classes', [0, 1, 3, 4, 7])  # dog, poo, toy, human
         self.declare_parameter('incoming_dir', '/incoming_raw')
         self.declare_parameter('reload_check_sec', 10.0)
         self.declare_parameter('max_obstacle_range', 4.0)
@@ -282,6 +283,12 @@ class DepthFusionNode(Node):
         if not uncertain or now - self.last_al_save < 10.0 or not os.path.isdir(self.incoming_dir):
             return
         self.last_al_save = now
+        # Without a training server the images stay on the mower's disk: never fill it up
+        usage = shutil.disk_usage(self.incoming_dir)
+        if usage.free < 0.10 * usage.total:
+            self.get_logger().warn(f"Less than 10 % free on {self.incoming_dir} - not saving active learning "
+                                   "images (move them to the training server)", throttle_duration_sec=3600.0)
+            return
         filepath = os.path.join(self.incoming_dir, f"img_{int(now * 1000)}.jpg")
         cv2.imwrite(filepath, cv_image)
         self.get_logger().info(f"Saved uncertain object for active learning: {filepath}")

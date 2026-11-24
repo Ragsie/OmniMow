@@ -21,7 +21,7 @@ def init_qnn_runtime(log_level="ERROR"):
     At WARN, QAI AppBuilder logs the timing of every inference (several lines per frame).
     """
     try:
-        from qai_appbuilder import LogLevel, PerfProfile, ProfilingLevel, QNNConfig, Runtime
+        from qai_appbuilder import LogLevel, ProfilingLevel, QNNConfig, Runtime
     except ImportError as e:
         raise SystemExit(
             "qai_appbuilder is not installed for this Python. On the Radxa (Ubuntu 24.04, Python 3.12):\n"

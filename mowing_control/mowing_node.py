@@ -4,7 +4,8 @@ OmniMow mowing controller.
 
 Mission: undock -> mow every zone (perimeter passes, then stripes) -> dock. Along the way it
   * runs the blade only while following a pass, never while driving between passes,
-  * stops the blade and waits when the AI sees a hazard (dog) in front of the mower,
+  * stops the blade and waits when the AI sees a hazard (dog) in front of the mower, or when the AI
+    stops reporting (no /vision/hazard for VISION_TIMEOUT_SEC),
   * drives home to charge when the battery is low and resumes where it stopped,
   * keeps Nav2 inside the lawn and out of flower beds with a keepout costmap filter,
   * saves progress, so a stopped or interrupted mission continues instead of starting over.
@@ -17,7 +18,8 @@ Automatic lawn mapping (/omnimow/zones/auto_map): the mower drives along the law
 loop as a new zone.
 
 Services (std_srvs/Trigger)
-  /omnimow/start_mowing, /omnimow/stop_mowing, /omnimow/return_home, /omnimow/zones/auto_map
+  /omnimow/start_mowing, /omnimow/stop_mowing (also stops docking/undocking), /omnimow/return_home,
+  /omnimow/zones/auto_map
   /omnimow/zones/record_start, /omnimow/zones/record_save_zone,
   /omnimow/zones/record_save_exclusion, /omnimow/zones/record_cancel
 Topics
@@ -56,9 +58,13 @@ import edge_follow
 
 ZONES_FILE = os.getenv('OMNIMOW_ZONES_FILE', '/opt/omnimow/zones.json')
 PROGRESS_FILE = os.getenv('OMNIMOW_PROGRESS_FILE', '/opt/omnimow/mowing_progress.json')
+DOCK_FILE = os.getenv('OMNIMOW_DOCK_FILE', '/opt/omnimow/dock.json')  # Saved by docking_control
 GOAL_SUCCEEDED = 4  # action_msgs/GoalStatus.STATUS_SUCCEEDED
 MOWER_STUCK, MOWER_ESTOP = 4, 5  # /mower/state from the drive ESP32
 MAP_FRAME = 'map'                # RTAB-Map's garden map (map -> odom -> base_link)
+# No /vision/hazard for this long: depth_fusion (the AI that sees dogs) is not running, so the blade
+# stays off and the mower waits, as for a hazard in view
+VISION_TIMEOUT_SEC = 3.0
 
 
 def env_float(name, default):
@@ -91,6 +97,7 @@ class MowingController(Node):
         self.battery_current = 0.0
         self.hazard = False
         self.hazard_last_seen = 0.0
+        self.vision_seen = 0.0      # Last /vision/hazard message (true or false)
         self.mower_state = 0
         self.blade_erpm = 0
 
@@ -101,6 +108,7 @@ class MowingController(Node):
         self.home_thread = None
         self.stop_requested = False
         self.dock_after_stop = False
+        self.docking_stopped = False  # Stop pressed while docking/undocking: not an error
         self.plan = []
         self.plan_id = None
         self.pass_index = 0
@@ -143,6 +151,7 @@ class MowingController(Node):
         self.follow_client = ActionClient(self, FollowPath, 'follow_path', callback_group=self.cb)
         self.dock_cli = self.create_client(Trigger, '/omnimow/dock', callback_group=self.cb)
         self.undock_cli = self.create_client(Trigger, '/omnimow/undock', callback_group=self.cb)
+        self.dock_cancel_cli = self.create_client(Trigger, '/omnimow/dock_cancel', callback_group=self.cb)
 
         # Services
         for name, handler in [
@@ -171,10 +180,12 @@ class MowingController(Node):
         t, q = tf.transform.translation, tf.transform.rotation
         yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         self.pose = (t.x, t.y, yaw)
-        # Zone recording: a point every 25 cm while the mower is driven along the edge
-        if self.recording is not None:
-            if not self.recording or math.dist(self.recording[-1], self.pose[:2]) >= 0.25:
-                self.recording.append([round(t.x, 3), round(t.y, 3)])
+        # Zone recording: a point every 25 cm while the mower is driven along the edge. A local
+        # reference: a service callback in another thread may end the recording meanwhile
+        recording = self.recording
+        if recording is not None:
+            if not recording or math.dist(recording[-1], self.pose[:2]) >= 0.25:
+                recording.append([round(t.x, 3), round(t.y, 3)])
 
     def battery_cb(self, msg):
         if msg.voltage > 0:
@@ -182,6 +193,7 @@ class MowingController(Node):
             self.battery_current = msg.current
 
     def hazard_cb(self, msg):
+        self.vision_seen = time.time()
         if msg.data:
             self.hazard_last_seen = time.time()
             if not self.hazard and self.blade_erpm:
@@ -209,13 +221,23 @@ class MowingController(Node):
             self.get_logger().info(f"State {state}{': ' + message if message else ''}")
         self.state, self.message = state, message
 
+    def vision_lost(self):
+        return time.time() - self.vision_seen > VISION_TIMEOUT_SEC
+
+    def busy(self):
+        """A mission, edge mapping or a drive home is running."""
+        return any(t is not None and t.is_alive() for t in (self.mission_thread, self.home_thread))
+
     def publish_status(self):
         # Re-send the blade command every second (the cutter ESP32 keeps the last value)
         self.cutter_pub.publish(Int32(data=self.blade_erpm))
         total = len(self.plan)
+        # Local references: the mission thread may clear them while this runs
+        mapper, recording, pose = self.mapper, self.recording, self.pose
         self.mission_pub.publish(String(data=json.dumps({
             "state": self.state,
-            "active": bool(self.mission_thread and self.mission_thread.is_alive()),
+            # Also while driving home on its own (Home pressed while idle), so the app offers Stop
+            "active": self.busy(),
             "message": self.message,
             "pass": self.pass_index,
             "total_passes": total,
@@ -223,17 +245,17 @@ class MowingController(Node):
             "skipped_passes": self.skipped,
             "blade_on": self.blade_erpm != 0,
             "hazard": self.hazard,
-            "recording_points": len(self.recording) if self.recording is not None else None,
+            "recording_points": len(recording) if recording is not None else None,
             # Position on the SLAM map (metres, map origin = charging station) for the app's map
-            "pose": [round(self.pose[0], 2), round(self.pose[1], 2), round(self.pose[2], 3)] if self.pose else None,
-            "edge_mapping": {"state": self.mapper.state, "loop_length_m": round(self.mapper.length, 1)}
-            if self.mapper else None,
+            "pose": [round(pose[0], 2), round(pose[1], 2), round(pose[2], 3)] if pose else None,
+            "edge_mapping": {"state": mapper.state, "loop_length_m": round(mapper.length, 1)}
+            if mapper else None,
         })))
 
     # ------------------------------------------------------------------ services
     def handle_start(self, request, response):
-        if self.mission_thread and self.mission_thread.is_alive():
-            response.success, response.message = False, f"Mission already running ({self.state})"
+        if self.busy():
+            response.success, response.message = False, f"Mission already running ({self.state}) - stop it first"
             return response
         self.stop_requested = False
         self.dock_after_stop = False
@@ -251,6 +273,7 @@ class MowingController(Node):
         if self.mission_thread and self.mission_thread.is_alive():
             self.request_stop(dock=True)
         elif not (self.home_thread and self.home_thread.is_alive()):
+            self.stop_requested = False
             self.home_thread = threading.Thread(target=self.go_home, daemon=True)
             self.home_thread.start()
         response.success, response.message = True, "Returning to the charging station"
@@ -260,6 +283,14 @@ class MowingController(Node):
         self.stop_requested = True
         self.dock_after_stop = dock
         self.set_blade(False)
+        if not dock:
+            # Docking and undocking run in docking_control: stop them there too
+            self.cancel_docking()
+
+    def cancel_docking(self):
+        self.docking_stopped = True
+        if self.dock_cancel_cli.service_is_ready():
+            self.dock_cancel_cli.call_async(Trigger.Request())
 
     def handle_record_start(self, request, response):
         self.recording = []
@@ -286,8 +317,8 @@ class MowingController(Node):
         return np.vstack(fresh) if fresh else np.zeros((0, 2))
 
     def handle_auto_map(self, request, response):
-        if self.mission_thread and self.mission_thread.is_alive():
-            response.success, response.message = False, f"Mission already running ({self.state})"
+        if self.busy():
+            response.success, response.message = False, f"Mission already running ({self.state}) - stop it first"
             return response
         if '/vision/boundary_points' not in self.edge_sources:
             response.success, response.message = False, "No lawn edge data - is depth_fusion running with OMNIMOW_AI_GRASS_BOUNDARY=true?"
@@ -364,11 +395,15 @@ class MowingController(Node):
         zones = [z for z in self.load_zones()['zones'] if z.get('enabled', True)]
         if not zones:
             raise RuntimeError(f"No zones defined in {ZONES_FILE}")
-        settings = [self.cut_width, self.overlap, self.edge_margin, self.perimeter_passes]
+        # 'start=origin': plans ordered from where the mower stood (older versions) get a new ID,
+        # so their saved progress is not applied to a different order of passes
+        settings = [self.cut_width, self.overlap, self.edge_margin, self.perimeter_passes, 'start=origin']
         plan_id = hashlib.sha1(json.dumps([zones, settings], sort_keys=True).encode()).hexdigest()[:12]
 
         plan, allowed, forbidden = [], [], []
-        start = self.pose[:2] if self.pose else (0.0, 0.0)
+        # Always ordered from the map origin (the charging station), not from where the mower stands:
+        # the saved progress is a pass number, so a resumed mission needs the same order of passes
+        start = (0.0, 0.0)
         for zone in zones:
             boundary = [tuple(p) for p in zone['boundary']]
             exclusions = [[tuple(p) for p in e] for e in zone.get('exclusions', [])]
@@ -463,13 +498,27 @@ class MowingController(Node):
         return self.battery_pct is not None and self.battery_pct < self.battery_return
 
     def is_docked(self):
-        return self.battery_current > 0.08  # Same charging detection as docking_node
+        """In the charging station: charging current (same detection as docking_node), or, as a full
+        battery may draw no current, standing where docking_control saved the dock."""
+        if self.battery_current > 0.08:
+            return True
+        pose = self.pose
+        if pose is None:
+            return False
+        try:
+            with open(DOCK_FILE) as f:
+                dock = json.load(f)
+            return math.dist(pose[:2], (float(dock['x']), float(dock['y']))) < 0.3
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
 
     def call_trigger(self, client, name, timeout=600.0):
         if not client.wait_for_service(timeout_sec=5.0):
             return False, f"{name} not available"
         res = self.wait(client.call_async(Trigger.Request()), timeout)
         if res is None:
+            if client in (self.dock_cli, self.undock_cli):
+                self.cancel_docking()  # Do not leave the mower driving after we gave up on it
             return False, f"{name} timed out"
         return res.success, res.message
 
@@ -493,11 +542,12 @@ class MowingController(Node):
         while not result_future.done():
             if self.stop_requested or self.mower_state in (MOWER_STUCK, MOWER_ESTOP):
                 reason = 'stop'
-            elif interrupt_on_hazard and self.hazard:
+            elif interrupt_on_hazard and (self.hazard or self.vision_lost()):
                 reason = 'hazard'
             elif self.battery_low():
                 reason = 'battery'
             if reason:
+                self.set_blade(False)  # Right away, not only once Nav2 has cancelled the goal
                 self.wait(handle.cancel_goal_async(), 5.0)
                 self.wait(result_future, 10.0)
                 break
@@ -577,7 +627,7 @@ class MowingController(Node):
             self.set_state('MAPPING', 'Looking for the lawn edge')
             while True:
                 self.check_abort()
-                if self.hazard:
+                if self.hazard or self.vision_lost():
                     self.drive(0.0, 0.0)
                     self.wait_for_hazard_clear()
                     self.set_state('MAPPING', 'Following the lawn edge')
@@ -623,16 +673,24 @@ class MowingController(Node):
 
     def leave_dock(self):
         self.set_state('UNDOCKING')
+        self.docking_stopped = False
         ok, msg = self.call_trigger(self.undock_cli, 'undock', 60.0)
         if not ok:
+            self.check_abort()  # Stopped while undocking: a stop, not an error
             raise RuntimeError(f"Undock failed: {msg}")
 
     def go_home(self, final_state='CHARGING', message=''):
         self.set_blade(False)
         self.set_keepout(False)
         self.set_state('RETURNING', message)
+        self.docking_stopped = False
         ok, msg = self.call_trigger(self.dock_cli, 'dock')
-        self.set_state(final_state if ok else 'ERROR', message if ok else f"Docking failed: {msg}")
+        if ok:
+            self.set_state(final_state, message)
+        elif self.docking_stopped or self.mower_state in (MOWER_STUCK, MOWER_ESTOP):
+            self.set_state('STOPPED', msg)
+        else:
+            self.set_state('ERROR', f"Docking failed: {msg}")
         return ok
 
     def charge_and_resume(self):
@@ -641,8 +699,10 @@ class MowingController(Node):
         self.save_progress(self.pass_index)
         self.set_state('RETURNING', 'Battery low')
         self.set_keepout(False)
+        self.docking_stopped = False
         ok, msg = self.call_trigger(self.dock_cli, 'dock')
         if not ok:
+            self.check_abort()
             raise RuntimeError(f"Docking for charging failed: {msg}")
         self.set_state('CHARGING', f"Resuming at {int(self.battery_resume * 100)}%")
         while self.battery_pct is None or self.battery_pct < self.battery_resume:
@@ -652,8 +712,9 @@ class MowingController(Node):
 
     def wait_for_hazard_clear(self):
         self.set_blade(False)
-        self.set_state('PAUSED', 'Hazard in view (dog) - waiting')
-        while self.hazard:
+        while self.hazard or self.vision_lost():
+            self.set_state('PAUSED', 'Hazard in view (dog) - waiting' if self.hazard
+                           else 'No AI vision (is depth_fusion running?) - waiting')
             self.check_abort()
             time.sleep(0.2)
 
@@ -663,7 +724,7 @@ class MowingController(Node):
         remaining = coverage.densify(mow_pass['points'])
         while True:
             self.check_abort()
-            if self.hazard:
+            if self.hazard or self.vision_lost():
                 self.wait_for_hazard_clear()
             if self.battery_low():
                 self.charge_and_resume()
@@ -682,7 +743,7 @@ class MowingController(Node):
                 return False
 
             # 2. Blade on, let it spin up, then follow the pass with the controller
-            if self.hazard:
+            if self.hazard or self.vision_lost():
                 continue
             self.set_blade(True)
             time.sleep(2.0)

@@ -10,7 +10,7 @@
 #include <std_msgs/msg/empty.h> // Empty message type for watchdog
 #include <driver/twai.h>
 #include <Wire.h>               // I2C for BNO085 IMU
-#include <SparkFun_BNO080_Arduino_Library.h> // SparkFun BNO085 Library
+#include <SparkFun_BNO080_Arduino_Library.h>
 #include <std_msgs/msg/bool.h>               // Bool message type for rain sensor
 #include <sensor_msgs/msg/imu.h>
 #include <nav_msgs/msg/odometry.h>
@@ -50,7 +50,7 @@
 // Calibrate: ERPM_PER_MPS = motor_pole_pairs * gear_ratio * 60 / (PI * wheel_diameter_m)
 #define ERPM_PER_MPS 3000.0
 
-// Autoro VESC IDs on the CAN bus (with #ifndef guards to prevent redefinition warnings from platformio.ini)
+// Autoro VESC IDs on the CAN bus (defaults if the build flags do not set them)
 #ifndef VESC_LEFT_ID
 #define VESC_LEFT_ID  1
 #endif
@@ -60,33 +60,33 @@
 #endif
 
 rcl_subscription_t subscriber;
-rcl_subscription_t heartbeat_sub;           // Heartbeat receiver
-rcl_publisher_t battery_pub;                //
-rcl_publisher_t state_pub;                  //
-rcl_publisher_t cycles_pub;                 //
-rcl_publisher_t drive_current_pub;          //
-rcl_publisher_t rain_pub;                   // ROS 2 rain sensor publisher
+rcl_subscription_t heartbeat_sub;
+rcl_publisher_t battery_pub;
+rcl_publisher_t state_pub;
+rcl_publisher_t cycles_pub;
+rcl_publisher_t drive_current_pub;
+rcl_publisher_t rain_pub;
 rcl_publisher_t imu_pub;
 geometry_msgs__msg__Twist msg_twist;
-std_msgs__msg__Empty heartbeat_msg;         // Heartbeat message
-sensor_msgs__msg__BatteryState battery_msg;  //
-std_msgs__msg__Int32 state_msg;             //
-std_msgs__msg__Int32 cycles_msg;            //
-std_msgs__msg__Float32 drive_current_msg;   //
-std_msgs__msg__Bool rain_msg;               // ROS 2 rain sensor message
+std_msgs__msg__Empty heartbeat_msg;
+sensor_msgs__msg__BatteryState battery_msg;
+std_msgs__msg__Int32 state_msg;
+std_msgs__msg__Int32 cycles_msg;
+std_msgs__msg__Float32 drive_current_msg;
+std_msgs__msg__Bool rain_msg;
 sensor_msgs__msg__Imu imu_msg;
 rcl_publisher_t odom_pub;                   // Wheel odometry for FusionCore (/wheel/odom)
 nav_msgs__msg__Odometry odom_msg;
 rclc_executor_t executor;
 
-// The Radxa must refresh this timestamp; otherwise the hardware relay removes motor power.
-// Watchdog variable to catch a frozen or disconnected Radxa computer
+// Set by each heartbeat from the Radxa; 500 ms without one (after the first) cuts the drive motors
 volatile unsigned long last_heartbeat_time = 0;
 const unsigned long WATCHDOG_TIMEOUT_MS = 500;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 
+// Latched: only a restart of the ESP32 (reset_esp32.sh) clears it
 volatile bool emergency_stop = false;
 bool can_stopped = false;                   // twai_stop() is not ISR-safe, so loop() stops the bus
 unsigned long last_bms_request = 0;         // BMS polling timer
@@ -96,7 +96,7 @@ int32_t expected_erpm_left = 0;
 int32_t expected_erpm_right = 0;
 bool drive_stuck = false;
 
-// BNO085 IMU instance for tilt/lift detection
+// BNO085 IMU: tilt check and IMU data for the localization
 BNO080 myIMU;
 bool imu_present = false;
 unsigned long last_state_publish = 0;
@@ -120,7 +120,7 @@ void stamp_now(builtin_interfaces__msg__Time &stamp) {
 // Hardware interrupt: triggers instantly on physical collision or STOP button
 void IRAM_ATTR handleBumper() {
     emergency_stop = true;
-    digitalWrite(RELAY_PIN, LOW); // Cut power to the 40A automotive relay immediately!
+    digitalWrite(RELAY_PIN, LOW); // Relay off: cuts the drive motors
     // The CAN bus is stopped from loop(), because twai_stop() must not be called from an ISR
 }
 
@@ -223,7 +223,7 @@ void subscription_callback(const void * msvgin) {
     double linear_x = msg->linear.x;
     double angular_z = msg->angular.z;
 
-    // ANTI-LAWN-TEARING FILTER
+    // Fast turns on the spot (> 0.5 rad/s) tear up the grass: make them a slow arc forward (Nav2 does not know)
     if (abs(angular_z) > 0.5 && abs(linear_x) < 0.05) {
         angular_z = (angular_z > 0) ? 0.2 : -0.2;
         linear_x = 0.08;
@@ -234,8 +234,8 @@ void subscription_callback(const void * msvgin) {
     double speed_left = linear_x - (angular_z * track_width / 2.0);
     double speed_right = linear_x + (angular_z * track_width / 2.0);
 
-    expected_erpm_left = speed_left * 3000.0;
-    expected_erpm_right = speed_right * 3000.0;
+    expected_erpm_left = speed_left * ERPM_PER_MPS;
+    expected_erpm_right = speed_right * ERPM_PER_MPS;
 
     if (abs(linear_x) < 0.01 && abs(angular_z) < 0.01) {
         drive_stuck = false;
@@ -365,6 +365,13 @@ void setup() {
     init_twai();
     set_microros_serial_transports(Serial);
 
+    // Wait for the micro-ROS agent (a Docker container on the Radxa). It starts after this ESP32
+    // when the ESP32 is restarted at boot (omnimow-esp32-reset.service), and a session created
+    // while the agent is not there never connects.
+    while (rmw_uros_ping_agent(1000, 1) != RMW_RET_OK) {
+        delay(500);
+    }
+
     allocator = rcl_get_default_allocator();
     rclc_support_init(&support, 0, NULL, &allocator);
     rclc_node_init_default(&node, "drive_controller", "", &support);
@@ -476,11 +483,11 @@ void loop() {
     unsigned long now_ms = millis();
     if (!emergency_stop && last_heartbeat_time > 0 && (now_ms - last_heartbeat_time > WATCHDOG_TIMEOUT_MS)) {
         emergency_stop = true;
-        digitalWrite(RELAY_PIN, LOW); // Immediate physical emergency stop of the 40A automotive relay!
+        digitalWrite(RELAY_PIN, LOW); // Relay off: cuts the drive motors
         LOGLN("FATAL: WATCHDOG TIMEOUT! Radxa computer stopped responding. Power cut!");
     }
 
-    // BNO085 tilt (roll) and lift monitoring for extreme physical safety
+    // Tilt check (BNO085) and IMU data for the localization
     if (!emergency_stop && imu_present && myIMU.dataAvailable() == true) {
         float roll = (myIMU.getRoll()) * 180.0 / PI;   // Convert Pitch/Roll radians to degrees
         float pitch = (myIMU.getPitch()) * 180.0 / PI;
@@ -503,10 +510,10 @@ void loop() {
             rcl_publish(&imu_pub, &imu_msg, NULL);
         }
 
-        // Safety lock: if lawnmower tilts more than 35 degrees or is lifted
+        // More than 35 degrees of roll or pitch: emergency stop
         if (!emergency_stop && (abs(roll) > 35.0 || abs(pitch) > 35.0)) {
             emergency_stop = true;
-            digitalWrite(RELAY_PIN, LOW); // Cut power to 40A main relay immediately!
+            digitalWrite(RELAY_PIN, LOW); // Relay off: cuts the drive motors
             LOG("FATAL: EMERGENCY STOP! Lift/Tilt detected! Roll: "); LOG(roll);
             LOG(" deg | Pitch: "); LOG(pitch); LOGLN(" deg");
         }
@@ -522,7 +529,7 @@ void loop() {
     if (!emergency_stop) {
         rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
 
-        // Continue polling sensors and publishing telemetry while the safety lock is active.
+        // Normal operation: poll the BMS, read the VESCs, publish telemetry and odometry
         unsigned long now = millis();
         if (now - last_bms_request >= BMS_INTERVAL) {
             last_bms_request = now;

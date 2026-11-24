@@ -16,7 +16,7 @@
   <joint name="camera_joint" type="fixed">
     <parent link="base_link"/>
     <child link="camera_link"/>
-    <!-- Dynamic parameters are extracted from the launch file and injected here -->
+    <!-- Filled in by mower.launch.py from omnimow.env -->
     <origin xyz="{CAMERA_OFFSET_X} 0.0 {CAMERA_HEIGHT_Z}" rpy="0.0 {CAMERA_PITCH_Y} 0.0"/>
   </joint>
 

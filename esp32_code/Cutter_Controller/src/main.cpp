@@ -5,6 +5,7 @@
 #include <rclc/executor.h>
 #include <std_msgs/msg/int32.h>
 #include <std_msgs/msg/empty.h> // Empty for watchdog
+#include <rmw_microros/rmw_microros.h> // Waiting for the agent
 #include <driver/twai.h>
 
 #define CAN_TX_PIN GPIO_NUM_21
@@ -25,29 +26,29 @@
 
 rcl_subscription_t subscriber;
 rcl_subscription_t heartbeat_sub;           // Heartbeat watchdog subscription
-rcl_publisher_t status_pub;                 //
-rcl_publisher_t rpm_pub;                    //
-rcl_publisher_t current_pub;                //
+rcl_publisher_t status_pub;
+rcl_publisher_t rpm_pub;
+rcl_publisher_t current_pub;
 std_msgs__msg__Int32 msg_speed;
-std_msgs__msg__Empty heartbeat_msg;         // Heartbeat message
-std_msgs__msg__Int32 status_msg;            //
-std_msgs__msg__Int32 rpm_msg;               //
-std_msgs__msg__Float32 current_msg;         //
+std_msgs__msg__Empty heartbeat_msg;
+std_msgs__msg__Int32 status_msg;
+std_msgs__msg__Int32 rpm_msg;
+std_msgs__msg__Float32 current_msg;
 rclc_executor_t executor;
 
-// The cutter is disabled when the main computer stops sending its heartbeat.
-// Cutter watchdog to detect computer failure
+// Set by each heartbeat; loop() stops the blade when none came for 500 ms
 volatile unsigned long last_heartbeat_time = 0;
 const unsigned long WATCHDOG_TIMEOUT_MS = 500;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 
-int32_t expected_erpm = 0;                  //
-int32_t actual_rpm = 0;                     //
-float actual_current = 0.0;                 //
+int32_t expected_erpm = 0;
+int32_t actual_rpm = 0;
+float actual_current = 0.0;
 bool cutter_blocked = false;                // Overload / blocked flag
 unsigned long last_status_publish = 0;
+unsigned long last_command_sent = 0;        // The blade command is repeated (VESC command timeout)
 
 void init_twai() {
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
@@ -77,7 +78,6 @@ void set_cutter_rpm(int32_t erpm) {
 // Read VESC status frames and publish cutter health telemetry once per second.
 void read_vesc_telemetry() {
     twai_message_t rx_msg;
-    // Read CAN frames
     while (twai_receive(&rx_msg, 0) == ESP_OK) {
         uint32_t id = rx_msg.identifier;
         uint8_t cmd = (id >> 8) & 0xFF;
@@ -88,13 +88,10 @@ void read_vesc_telemetry() {
                 int32_t rpm = (rx_msg.data[0] << 24) | (rx_msg.data[1] << 16) | (rx_msg.data[2] << 8) | rx_msg.data[3];
                 float current = ((int16_t)((rx_msg.data[4] << 8) | rx_msg.data[5])) / 10.0;
 
-                // Store values for measurement
-                actual_rpm = rpm / 10; // VESC reports ERPM; divide by 10 (for a 10-pole motor) to get real RPM
+                actual_rpm = rpm / 10; // VESC reports ERPM; divide by the motor's pole pairs (here 10) to get real RPM
                 actual_current = current;
 
-                // BLOCKING TEST: If the blade is supposed to run (ERPM > 1000),
-                // but the actual RPM is below 100 (blade is idle/stuck)
-                // and the current is simultaneously very high (> 15.0A), then the cutter is blocked!
+                // Blocked: should run (> 1000 ERPM) but turns under 100 ERPM at more than 15 A
                 if (expected_erpm > 1000 && abs(rpm) < 100 && fabs(current) > 15.0) {
                     cutter_blocked = true;
                     set_cutter_rpm(0); // Immediate emergency stop to protect the motor and drivetrain
@@ -110,7 +107,6 @@ void read_vesc_telemetry() {
     if (now - last_status_publish >= 1000) {
         last_status_publish = now;
 
-        // Publish status, RPM, and current
         status_msg.data = cutter_blocked ? 2 : (expected_erpm > 0 ? 1 : 0);
         rpm_msg.data = actual_rpm;
         current_msg.data = actual_current;
@@ -144,16 +140,22 @@ void subscription_callback(const void * msvgin) {
 }
 
 void setup() {
-    // Tilt/lift detection with the BNO085 runs on the drive controller.
+    // Tilt detection (BNO085) runs on the drive controller and does not stop the blade itself
     Serial.begin(115200);  // micro-ROS transport, must match "-b" of microros_cutter in docker-compose.yml
     init_twai();
     set_microros_serial_transports(Serial);
+
+    // Wait for the micro-ROS agent (a Docker container on the Radxa). It starts after this ESP32
+    // when the ESP32 is restarted at boot (omnimow-esp32-reset.service), and a session created
+    // while the agent is not there never connects.
+    while (rmw_uros_ping_agent(1000, 1) != RMW_RET_OK) {
+        delay(500);
+    }
 
     allocator = rcl_get_default_allocator();
     rclc_support_init(&support, 0, NULL, &allocator);
     rclc_node_init_default(&node, "cutter_controller", "", &support);
 
-    // Initialize ROS 2 subscription on /cutter/speed
     rclc_subscription_init_default(
         &subscriber,
         &node,
@@ -161,7 +163,6 @@ void setup() {
         "/cutter/speed"
     );
 
-    // Initialize ROS 2 publisher on /cutter/status
     rclc_publisher_init_default(
         &status_pub,
         &node,
@@ -169,7 +170,6 @@ void setup() {
         "/cutter/status"
     );
 
-    // Initialize ROS 2 publisher on /cutter/rpm
     rclc_publisher_init_default(
         &rpm_pub,
         &node,
@@ -177,7 +177,6 @@ void setup() {
         "/cutter/rpm"
     );
 
-    // Initialize ROS 2 publisher on /cutter/current
     rclc_publisher_init_default(
         &current_pub,
         &node,
@@ -200,19 +199,26 @@ void setup() {
 }
 
 void loop() {
-    // Watchdog check. If the computer freezes, the blade is immediately switched off!
+    // Watchdog: no heartbeat for 500 ms (only after the first one) -> blade off
     unsigned long now_ms = millis();
     if (last_heartbeat_time > 0 && (now_ms - last_heartbeat_time > WATCHDOG_TIMEOUT_MS)) {
         if (expected_erpm != 0) {
             LOGLN("FATAL: CUTTER WATCHDOG TIMEOUT! Stopped cutting blade immediately!");
         }
         expected_erpm = 0;
-        set_cutter_rpm(0); // Switch blade off immediately!
+        set_cutter_rpm(0);
         actual_rpm = 0;
         actual_current = 0.0;
     }
 
+    // Repeat the blade command every 100 ms: /cutter/speed arrives about once a second, and the
+    // VESC stops the motor when no command came within its timeout (VESC Tool: App -> Timeout, 1 s)
+    if (now_ms - last_command_sent >= 100) {
+        last_command_sent = now_ms;
+        set_cutter_rpm(cutter_blocked ? 0 : expected_erpm);
+    }
+
     rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
-    read_vesc_telemetry(); //
+    read_vesc_telemetry();
     delay(10);
 }

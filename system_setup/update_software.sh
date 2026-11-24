@@ -2,12 +2,16 @@
 # OmniMow software updater: tells the app about a new GitHub release and installs it on request.
 #
 # The repository the mower was installed from (host_setup.sh) is compared with the newest release
-# of OMNIMOW_SOFTWARE_REPO. A release is made from main on GitHub (see .github/workflows/release.yml).
+# of the GitHub repository it was cloned from (its origin), or of OMNIMOW_SOFTWARE_REPO if that is set.
+# So a mower installed from a fork or a development repository updates from there. A release is made
+# from main on GitHub (see .github/workflows/release.yml).
 # The result goes to /opt/omnimow/software_update.json, which app_backend sends to the app. When the
 # user taps "Update" in the app, app_backend writes /opt/omnimow/update_request, and
 # omnimow-software-update.path runs this script: the release is checked out and host_setup.sh
 # rebuilds and restarts what changed. The mower's own settings are in /etc/omnimow/robot.env,
 # outside the repository, so the release's omnimow.env (the defaults) can simply replace the old one.
+# Then the mower reboots by itself: the drive ESP32 locked its emergency stop while the containers
+# restarted, and omnimow-esp32-reset.service restarts the ESP32s at boot (see reset_esp32.sh).
 #
 #   update_software.sh --check      look for a newer release (omnimow-software-check.timer)
 #   update_software.sh --install    install the newest release
@@ -18,7 +22,7 @@
 set -euo pipefail
 
 ENV_FILE=/etc/omnimow/omnimow.env
-# robot.env (configure_robot.sh) after omnimow.env: e.g. OMNIMOW_SOFTWARE_REPO of a fork
+# robot.env (configure_robot.sh) after omnimow.env: e.g. OMNIMOW_SOFTWARE_REPO to update from another repository
 for env_file in "$ENV_FILE" /etc/omnimow/robot.env; do
     if [ -f "$env_file" ]; then
         set -a
@@ -27,7 +31,6 @@ for env_file in "$ENV_FILE" /etc/omnimow/robot.env; do
         set +a
     fi
 done
-REPO="${OMNIMOW_SOFTWARE_REPO:-Ragsie/OmniMow}"
 STATUS_FILE=/opt/omnimow/software_update.json
 INSTALL_REQUEST=/opt/omnimow/update_request
 CHECK_REQUEST=/opt/omnimow/check_request
@@ -52,12 +55,26 @@ fi
 REPO_DIR="$(dirname "$(dirname "$(readlink -f "$ENV_FILE")")")"
 if [ ! -e "$REPO_DIR/.git" ]; then
     # E.g. installed from a downloaded zip: tell the app why there are no updates
-    message="$REPO_DIR is not a git clone (no .git) - install from a clone (git clone https://github.com/$REPO.git) to get updates from the app"
+    message="$REPO_DIR is not a git clone (no .git) - install from a clone (git clone https://github.com/${OMNIMOW_SOFTWARE_REPO:-Ragsie/OmniMow}.git) to get updates from the app"
     python3 -c 'import json, sys, time; json.dump({"state": "error", "available": False, "message": sys.argv[2],
 "installed": "unknown", "updated_at": int(time.time())}, open(sys.argv[1], "w"), indent=2)' "$STATUS_FILE" "$message"
     echo "$message"
     exit 1
 fi
+# owner/name of the GitHub repository a clone was made from (its origin), or nothing. Read from the
+# clone's config file, so it also works as root on a clone owned by the user
+origin_repo() {
+    local url
+    url=$(git config --file "$1/.git/config" --get remote.origin.url 2>/dev/null) || return 0
+    url=${url%.git}
+    case "$url" in
+        *github.com[:/]*/*) echo "${url##*github.com[:/]}" ;;
+    esac
+}
+# Updates come from OMNIMOW_SOFTWARE_REPO, otherwise from the repository the clone was made from
+REPO="${OMNIMOW_SOFTWARE_REPO:-$(origin_repo "$REPO_DIR")}"
+REPO="${REPO:-Ragsie/OmniMow}"
+
 # git as the owner of the clone (as root, git refuses a repository owned by another user)
 OWNER="$(stat -c %U "$REPO_DIR")"
 g() { sudo -u "$OWNER" git -C "$REPO_DIR" "$@"; }
@@ -104,7 +121,7 @@ fetch_release() {
         exit 1
     }
     tag=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])' <<< "$release_json")
-    # From OMNIMOW_SOFTWARE_REPO itself, which need not be the clone's origin (e.g. a clone of a fork)
+    # From $REPO itself, which need not be the clone's origin (OMNIMOW_SOFTWARE_REPO)
     git_auth=()
     if [ -s "$TOKEN_FILE" ]; then
         basic=$(printf 'x-access-token:%s' "$(tr -d '[:space:]' < "$TOKEN_FILE")" | base64 -w0)
@@ -133,7 +150,7 @@ check() {
 
 install() {
     fetch_release
-    status installing "Installing $tag - the mower restarts its services when done"
+    status installing "Installing $tag - the mower restarts when done"
     # Changes made by hand in omnimow.env move to robot.env first, so the checkout can replace it
     if [ -f "$REPO_DIR/system_setup/configure_robot.sh" ]; then
         bash "$REPO_DIR/system_setup/configure_robot.sh" --migrate >> "$LOG" 2>&1 || {
@@ -147,7 +164,10 @@ install() {
     fi
     echo "=== Installing $tag ($(date)) ===" >> "$LOG"
     if OMNIMOW_FORCE_RECREATE=true bash "$REPO_DIR/system_setup/host_setup.sh" --user "$OWNER" >> "$LOG" 2>&1; then
-        status up_to_date "Version $tag installed"
+        status up_to_date "Version $tag installed - the mower restarts"
+        touch /opt/omnimow/esp32_reset_pending
+        echo "=== Rebooting after installing $tag ($(date)) ===" >> "$LOG"
+        systemctl --no-block reboot
     else
         status failed "Installing $tag failed - see $LOG on the mower"
         exit 1

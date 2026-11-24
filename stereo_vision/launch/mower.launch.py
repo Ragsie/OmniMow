@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess
+from launch.actions import ExecuteProcess, Shutdown
 from launch_ros.actions import Node
 import os
 
@@ -15,7 +15,7 @@ def generate_launch_description():
     with open(urdf_file, 'r') as infp:
         robot_desc = infp.read()
 
-    # Load chassis and camera specifications from environment variables (from omnimow.env) with robust fallbacks [DYNAMIC LOADING]
+    # Camera mount from omnimow.env (defaults if not set)
     camera_x = os.getenv('OMNIMOW_CAMERA_OFFSET_X', '0.25')
     camera_z = os.getenv('OMNIMOW_CAMERA_HEIGHT_Z', '0.10')
     camera_pitch = os.getenv('OMNIMOW_CAMERA_PITCH_Y', '0.0')
@@ -32,7 +32,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        # Publish robot transformations (TF-tree with dynamically formatted URDF)
+        # TF from the URDF, with the camera mount filled in
         Node(
             package='robot_state_publisher',
             executable='robot_state_publisher',
@@ -40,7 +40,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{'robot_description': robot_desc_formatted}]
         ),
-        # Start the central 3D Stereo Vision node (with parameters from omnimow.env) [MIGRATED TO DUAL CAM]
+        # Stereo node
         ExecuteProcess(
             cmd=[
                 'python3', os.path.join(APP_DIR, 'stereo_node.py'),
@@ -50,6 +50,10 @@ def generate_launch_description():
                 '-p', f'camera_offset_x:={float(camera_x)}',
                 '-p', f'camera_pitch_y:={float(camera_pitch)}',
             ],
-            output='screen'
+            output='screen',
+            # Without the stereo node the launch must end, so Docker restarts the container: it exits
+            # when the calibration was removed (recalibration from the app) or the cameras did not open,
+            # and robot_state_publisher alone would otherwise keep the container running
+            on_exit=Shutdown(reason='stereo_node exited')
         )
     ])

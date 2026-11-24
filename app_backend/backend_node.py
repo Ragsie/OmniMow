@@ -4,7 +4,7 @@ import uvicorn
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import Int32, Float32, Empty, Bool, String  # Rain sensor message type
+from std_msgs.msg import Int32, Float32, Empty, Bool, String
 from std_srvs.srv import Trigger
 from nav_msgs.msg import Odometry
 import threading
@@ -13,7 +13,7 @@ import asyncio
 import os
 import math
 import time
-import shutil # Added: for SSD guard
+import shutil
 
 # ROS 2 to HTTP/WebSocket bridge for mower telemetry, schedules, and control.
 app = FastAPI(title="OmniMow API Gateway")
@@ -40,9 +40,10 @@ class BackendROSNode(Node):
         self.cutter_rpm_sub = self.create_subscription(Int32, '/cutter/rpm', self.cutter_rpm_callback, 10)
 
         # Supporting telemetry used by the app dashboard and persistent statistics.
-        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        # Nothing publishes /odom: FusionCore's fused odometry (localization container)
+        self.odom_sub = self.create_subscription(Odometry, '/fusion/odom', self.odom_callback, 10)
         self.charge_cycles_sub = self.create_subscription(Int32, '/battery/charge_cycles', self.charge_cycles_callback, 10)
-        self.rain_sub = self.create_subscription(Bool, '/mower/rain', self.rain_callback, 10) # Added: rain sensor subscriber
+        self.rain_sub = self.create_subscription(Bool, '/mower/rain', self.rain_callback, 10)
 
         # Heartbeat publisher for ESP32 hardware watchdog
         self.heartbeat_pub = self.create_publisher(Empty, '/mower/heartbeat', 10)
@@ -57,13 +58,17 @@ class BackendROSNode(Node):
             'zones/record_start', 'zones/record_save_zone', 'zones/record_save_exclusion', 'zones/record_cancel',
             'zones/auto_map']}
         self.last_started_slot = None  # Start at most once per schedule slot
+        # Only a mission the schedule started is sent home when its slot ends; one started by hand
+        # (app, Auto map) keeps running
+        self.schedule_started_mission = False
 
         # 10-second timer for schedule and rain delay logic
         self.schedule_timer = self.create_timer(10.0, self.check_schedule_timer)
 
         # Broadcasts are otherwise only triggered by ESP32 topics, so without the micro-ROS
         # agents the app would never receive system metrics (CPU, RAM, Wi-Fi, calibration).
-        self.status_timer = self.create_timer(2.0, self.broadcast_status)
+        self.status_timer = self.create_timer(2.0, self.status_tick)
+        self.last_broadcast = 0.0
 
         self.battery_v = 24.0
         self.battery_pct = 100.0
@@ -75,7 +80,7 @@ class BackendROSNode(Node):
         self.drive_current = 0.0
         self.cutter_rpm = 0
         self.charge_cycles = 0
-        self.is_raining = False # Added: rain sensor status
+        self.is_raining = False
 
         # Schedule configuration and rain drying timer
         self.rain_resume_time = 0.0  # Unix timestamp for when mowing may resume after rain
@@ -87,7 +92,7 @@ class BackendROSNode(Node):
             }
         }
 
-        # Persistent statistics loaded from the Orange Pi NVMe SSD
+        # Statistics kept across restarts
         self.stats_file = "/opt/omnimow/stats.json"
         self.total_distance_km = 0.0
         self.total_runtime_hours = 0.0
@@ -101,6 +106,7 @@ class BackendROSNode(Node):
         # CPU monitoring
         self.last_cpu_idle = 0
         self.last_cpu_total = 0
+        self.cpu_load = 0.0
 
     def load_stats(self):
         # Restore counters and user settings so a container restart does not reset them.
@@ -135,21 +141,23 @@ class BackendROSNode(Node):
             self.get_logger().error(f"Could not save stats file: {e}")
 
     def odom_callback(self, msg):
-        # Added: calculate Euclidean distance driven from wheel encoders and odometry tree
+        # Distance driven, counted in steps of at least 5 cm: at 100 Hz the small jitter of a
+        # standing mower's position estimate would otherwise add up to kilometres
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
 
-        if self.last_x is not None and self.last_y is not None:
-            dist_m = math.sqrt((x - self.last_x)**2 + (y - self.last_y)**2)
-            if dist_m < 5.0: # Safety threshold to avoid jumps during odom reset
-                self.total_distance_km += dist_m / 1000.0
-
-        self.last_x = x
-        self.last_y = y
+        if self.last_x is None or self.last_y is None:
+            self.last_x, self.last_y = x, y
+        else:
+            dist_m = math.hypot(x - self.last_x, y - self.last_y)
+            if dist_m >= 0.05:
+                if dist_m < 5.0:  # Safety threshold to avoid jumps during odom reset
+                    self.total_distance_km += dist_m / 1000.0
+                self.last_x, self.last_y = x, y
         self.update_runtime_and_save()
 
     def update_runtime_and_save(self):
-        # Added: update runtime if the machine is moving and save to disk every 10 seconds
+        # Runtime only counts while driving; stats are saved every 10 s
         now = time.time()
         dt = now - self.last_runtime_tick
         self.last_runtime_tick = now
@@ -194,10 +202,13 @@ class BackendROSNode(Node):
         self.broadcast_status()
 
     def mission_callback(self, msg):
+        was_active = self.mission.get("active", False)
         try:
             self.mission = json.loads(msg.data)
         except ValueError:
             return
+        if was_active and not self.mission.get("active", False):
+            self.schedule_started_mission = False
         self.broadcast_status()
 
     def state_callback(self, msg):
@@ -258,9 +269,11 @@ class BackendROSNode(Node):
                     and self.mission.get("state") != "ERROR"):
                 self.get_logger().info("Mowing schedule reached! Starting autonomous mowing.")
                 self.last_started_slot = current_slot
+                self.schedule_started_mission = True
                 self.trigger_autonomous_mow()
-        elif mission_active:
+        elif mission_active and self.schedule_started_mission:
             self.get_logger().info("Mowing window expired! Automatically sending the robot back to the dock.")
+            self.schedule_started_mission = False
             self.trigger_go_to_dock()
 
     def trigger_autonomous_mow(self):
@@ -294,7 +307,7 @@ class BackendROSNode(Node):
             with open("/proc/stat", "r") as f:
                 line = f.readline()
             parts = line.split()
-            # CPU user, nice, system, idle, iowait, irq, softirq
+            # user, nice, system, idle
             cpu_times = [int(x) for x in parts[1:5]]
             idle = cpu_times[3]
             total = sum(cpu_times)
@@ -312,7 +325,7 @@ class BackendROSNode(Node):
             return 0.0
 
     def get_wifi_rssi_dbm(self):
-        # Added: robust parsing of Linux Wi-Fi RSSI signal strength in dBm and %
+        # Wi-Fi signal from /proc/net/wireless, in dBm and %
         try:
             if not os.path.exists("/proc/net/wireless"):
                 return {"dbm": -99, "percentage": 0, "interface": "none"}
@@ -326,7 +339,7 @@ class BackendROSNode(Node):
                     rssi_str = parts[3].replace(".", "")
                     rssi = int(rssi_str)
 
-                    # Convert to percentage (0% to 100%)
+                    # -100 dBm = 0 %, -50 dBm = 100 %
                     if rssi <= -100:
                         pct = 0
                     elif rssi >= -50:
@@ -334,7 +347,6 @@ class BackendROSNode(Node):
                     else:
                         pct = int(2 * (rssi + 100))
 
-                    # Extract interface name (e.g. wlan0)
                     interface = parts[0].replace(":", "")
                     return {"dbm": rssi, "percentage": pct, "interface": interface}
             return {"dbm": -99, "percentage": 0, "interface": "unknown"}
@@ -342,7 +354,7 @@ class BackendROSNode(Node):
             return {"dbm": -99, "percentage": 0, "error": str(e)}
 
     def publish_heartbeat(self):
-        # Added: send heartbeat ping to confirm the Radxa is running for the ESP32
+        # Without this for 500 ms (after the first) the drive ESP32 cuts the drive motors and the cutter ESP32 stops the blade
         try:
             msg = Empty()
             self.heartbeat_pub.publish(msg)
@@ -368,7 +380,7 @@ class BackendROSNode(Node):
             return {"used_mb": 0, "total_mb": 0, "used_pct": 0.0}
 
     def get_disk_space_pct(self):
-        # SSD Guard - monitors free NVMe space on the Radxa Dragon Q6A
+        # Free space on / in %, shown in the app
         try:
             total, used, free = shutil.disk_usage("/")
             free_pct = (free / total) * 100.0
@@ -385,41 +397,52 @@ class BackendROSNode(Node):
                 "percentage": round(self.battery_pct, 1),
                 "current": round(self.battery_current, 2),
                 "temperature_celsius": round(self.battery_temp, 1),
-                "charge_cycles": self.charge_cycles #
+                "charge_cycles": self.charge_cycles
             },
             "state": self.state,
             "mission": self.mission,  # mowing_control: state, progress_pct, blade_on, hazard, ...
+            "map": read_map_positions(self.mission.get("pose")),  # Robot and charging station on the SLAM map
             "cutter_status": self.cutter_status,
             "cutter_rpm": self.cutter_rpm,
             "power_consumption": {
                 "total_bms_current_ampere": round(self.battery_current, 2),
                 "drive_motors_current_ampere": round(self.drive_current, 2),
                 "cutter_motor_current_ampere": round(self.cutter_current, 2),
-                "cutter_motor_power_watts": round(self.battery_v * self.cutter_current, 1) #
+                "cutter_motor_power_watts": round(self.battery_v * self.cutter_current, 1)
             },
-            "statistics": { #
+            "statistics": {
                 "total_distance_km": round(self.total_distance_km, 2),
                 "total_runtime_hours": round(self.total_runtime_hours, 1)
             },
             "system": {
                 "cpu_temp_celsius": self.get_system_temperature(),
-                "cpu_load_pct": self.get_cpu_load(),
+                "cpu_load_pct": self.cpu_load,
                 "memory": self.get_memory_usage(),
-                "wifi": self.get_wifi_rssi_dbm(), # Added: send Wi-Fi RSSI to the app
-                "disk_free_pct": self.get_disk_space_pct(), # SSD guard monitoring
-                "rain_detected": self.is_raining, # Added: rain sensor status for the app
+                "wifi": self.get_wifi_rssi_dbm(),
+                "disk_free_pct": self.get_disk_space_pct(),
+                "rain_detected": self.is_raining,
                 "rain_delay": { # Live status of the drying timer
                     "is_delayed": time.time() < self.rain_resume_time,
                     "remaining_seconds": max(0, int(self.rain_resume_time - time.time())),
-                    "resume_timestamp": self.rain_resume_time
+                    "resume_timestamp": self.rain_resume_time,
+                    "duration_seconds": self.rain_delay_duration  # Drying time after rain (setting)
                 },
-                "schedule": self.schedule # Added: send the schedule configuration to the app
+                "schedule": self.schedule
             }
         }
 
-    def broadcast_status(self):
-        if loop is None or not clients:
+    def status_tick(self):
+        # CPU load over the 2 s since the last tick: measured at every broadcast it would cover only
+        # the few milliseconds between two ESP32 messages
+        self.cpu_load = self.get_cpu_load()
+        self.broadcast_status(force=True)
+
+    def broadcast_status(self, force=False):
+        # Each ESP32 topic triggers a broadcast; at most two a second are sent (plus forced ones)
+        now = time.time()
+        if loop is None or not clients or (not force and now - self.last_broadcast < 0.5):
             return
+        self.last_broadcast = now
         message = json.dumps(self.build_status())
         for client in list(clients):
             try:
@@ -443,6 +466,29 @@ def read_calibration_status():
     if not os.path.exists(os.path.join(CALIBRATION_DIR, "left.yaml")) and status["state"] == "done":
         status["state"] = "recalibration_requested"
     return status
+
+
+DOCK_FILE = "/opt/omnimow/dock.json"
+
+
+def read_map_positions(robot_pose):
+    """Robot and charging station on the SLAM map (metres, radians), and where the station is seen
+    from the robot. The dock pose is saved by docking_control each time the mower docks or leaves
+    the dock; None until then (the map origin is where the mower stood in the dock)."""
+    try:
+        with open(DOCK_FILE) as f:
+            d = json.load(f)
+        dock = [round(float(d["x"]), 2), round(float(d["y"]), 2), round(float(d["yaw"]), 3)]
+    except (OSError, ValueError, KeyError, TypeError):
+        dock = None
+    relative = None
+    if dock and robot_pose:
+        dx, dy = dock[0] - robot_pose[0], dock[1] - robot_pose[1]
+        # Bearing from the robot's heading: 0 = straight ahead, positive = to the left
+        bearing = math.atan2(dy, dx) - robot_pose[2]
+        relative = {"distance_m": round(math.hypot(dx, dy), 2),
+                    "bearing_rad": round(math.atan2(math.sin(bearing), math.cos(bearing)), 3)}
+    return {"frame": "map", "robot": robot_pose, "dock": dock, "dock_from_robot": relative}
 
 
 SOFTWARE_STATUS_FILE = "/opt/omnimow/software_update.json"
@@ -485,7 +531,6 @@ def start_ros():
 
 @app.get("/api/schedule")
 async def get_schedule():
-    # Added: REST endpoint to fetch the current mowing schedule and rain delay
     if hasattr(app.state, "ros_node"):
         return {
             "schedule": app.state.ros_node.schedule,
@@ -497,32 +542,29 @@ async def get_schedule():
 
 @app.post("/api/schedule")
 async def post_schedule(new_schedule: dict):
-    # Added: REST endpoint to save a new schedule and update stats.json
     if hasattr(app.state, "ros_node"):
         app.state.ros_node.schedule = new_schedule
         app.state.ros_node.save_stats()
-        app.state.ros_node.broadcast_status()
+        app.state.ros_node.broadcast_status(force=True)
         return {"status": "success", "message": "Schedule updated persistently!"}
     return {"error": "ROS 2 node not started yet"}
 
 @app.post("/api/schedule/rain_delay")
 async def post_rain_delay(payload: dict):
-    # Added: REST endpoint to update the drying time
     if hasattr(app.state, "ros_node"):
         app.state.ros_node.rain_delay_duration = int(payload.get("duration_seconds", 7200))
         app.state.ros_node.save_stats()
-        app.state.ros_node.broadcast_status()
+        app.state.ros_node.broadcast_status(force=True)
         return {"status": "success", "message": "Drying duration updated!"}
     return {"error": "ROS 2 node not started yet"}
 
 @app.post("/api/schedule/skip_delay")
 async def skip_delay():
-    # Added: REST endpoint to skip the drying timer and force operation
     if hasattr(app.state, "ros_node"):
         app.state.ros_node.rain_resume_time = 0.0
         if app.state.ros_node.state == 9:
             app.state.ros_node.state = 0
-        app.state.ros_node.broadcast_status()
+        app.state.ros_node.broadcast_status(force=True)
         return {"status": "success", "message": "Rain delay skipped. The mower is ready!"}
     return {"error": "ROS 2 node not started yet"}
 

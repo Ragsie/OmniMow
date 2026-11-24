@@ -32,7 +32,6 @@ ENV GST_PLUGIN_PATH=/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0:/usr/local/li
 # cannot start, the cameras do not open.
 ENV LIBCAMERA_SOFTISP_MODE=cpu
 
-# Combine all system packages into a single layer and clean up to keep the image small and fast
 RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-numpy \
@@ -59,7 +58,6 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY . /app/
 
-# Make the startup script executable
 RUN chmod +x /app/start_vision.sh
 
 # Run the startup script instead of launching python directly

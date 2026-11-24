@@ -10,7 +10,9 @@ Uses the calibration from calibrate_stereo.py (ROS camera_info YAML files). Publ
   /stereo/left/image_rect_color                         bgr8 like the JPEG, only while something subscribes (debug)
   /stereo/depth_image                                   16UC1 millimetres (0 = no depth), aligned with the left image,
                                                         half its size (camera_info intrinsics scaled by 0.5)
-  /scan                                                 LaserScan in base_link
+  /scan                                                 LaserScan in base_link: the closest obstacle per angle
+  /scan_free                                            LaserScan in base_link: the farthest ground seen per angle
+                                                        (free space, only used by Nav2 to clear obstacles that are gone)
 """
 import os
 import time
@@ -125,6 +127,9 @@ class StereoNode(Node):
                 scale_intrinsics(K1, s), D1, R1, scale_intrinsics(P1[:3, :3], s), self.ai_size, cv2.CV_16SC2)
 
         self.publisher_scan = self.create_publisher(LaserScan, '/scan', 10)
+        self.publisher_scan_free = self.create_publisher(LaserScan, '/scan_free', 10)
+        # Lowest point (m above the ground) that counts as an obstacle; below it is grass/ground
+        self.scan_min_height = float(os.getenv('OMNIMOW_SCAN_MIN_HEIGHT', '0.05') or 0.05)
         self.publisher_depth = self.create_publisher(Image, '/stereo/depth_image', 10)
         # Large raw images (> ~512 KB) mostly get lost between the containers, so the colour image
         # goes out as JPEG and the depth in 16 bit (millimetres); the raw colour image only for debugging
@@ -141,8 +146,9 @@ class StereoNode(Node):
             self.cameras = StereoCapture(p('video_device_left') or None, p('video_device_right') or None,
                                          self.size[0], self.size[1], left_size=self.ai_size)
         except RuntimeError as e:
-            self.get_logger().error(f"Could not open the dual MIPI CSI cameras: {e}")
-            return
+            # Exit (the launch ends and Docker restarts the container) instead of idling without cameras
+            self.get_logger().error(f"Could not open the dual MIPI CSI cameras: {e} - retrying after a restart")
+            raise SystemExit(1)
 
         # StereoSGBM estimates horizontal pixel displacement between the rectified images (grayscale).
         # The largest disparity sets the closest depth: focal * baseline / numDisparities. More
@@ -168,7 +174,7 @@ class StereoNode(Node):
         self.worker = ThreadPoolExecutor(max_workers=1)
         min_depth = self.focal_length * self.baseline / num_disparities
         # Every frame costs stereo matching here and work in depth_fusion and SLAM; the mower moves
-        # slowly, so the default 10 FPS of the cameras' 15 is plenty
+        # slowly, so 10 FPS is plenty
         fps = float(os.getenv('OMNIMOW_STEREO_FPS', '10') or 10)
 
         self.get_logger().info(
@@ -293,9 +299,7 @@ class StereoNode(Node):
         msg.data.frombytes(data.tobytes())
         self.publisher_left_jpeg.publish(msg)
 
-    # ==========================================
-    #  3D VIRTUAL LIDAR ALGORITHM WITH PITCH COMPENSATION
-    # ==========================================
+    # ------------------------------------------------------------------ virtual LiDAR
     def publish_scan(self, depth_map, w, h, stamp):
         step = 4
         rows = np.arange(h // 4, h - 10, step)  # Exclude sky and very close bumper
@@ -319,34 +323,42 @@ class StereoNode(Node):
         Y_r = -x_c
         Z_r = -y_c * cos_t - z_c * sin_t + self.camera_height_z
 
-        # Only points above grass height (>= 5 cm) and below the robot body (<= 45 cm)
-        obstacle_mask = (Z_r >= 0.05) & (Z_r <= 0.45) & (X_r > 0.1) & (X_r < 4.0)
-        X_obs = X_r[obstacle_mask]
-        Y_obs = Y_r[obstacle_mask]
-        R_obs = np.sqrt(X_obs ** 2 + Y_obs ** 2)
-        alpha_obs = np.arctan2(Y_obs, X_obs)
-
-        # Horizontal field of view of the rectified image
+        # Horizontal field of view of the rectified image, one scan angle per image column
         fov_rad = 2.0 * np.arctan(w / (2.0 * self.focal_length))
-        scan = LaserScan()
-        scan.header.stamp = stamp
-        # The points are already transformed to base_link above (offset + pitch)
-        scan.header.frame_id = 'base_link'
-        scan.angle_min = -fov_rad / 2.0
-        scan.angle_max = fov_rad / 2.0
-        scan.angle_increment = fov_rad / w
-        scan.time_increment = 0.0
-        scan.scan_time = self.timer.timer_period_ns * 1e-9
-        scan.range_min = 0.15
-        scan.range_max = 4.0
+        angle_min, angle_increment = -fov_rad / 2.0, fov_rad / w
+        R_r = np.sqrt(X_r ** 2 + Y_r ** 2)
+        bins = ((np.arctan2(Y_r, X_r) - angle_min) / angle_increment).astype(int)
+        in_view = (bins >= 0) & (bins < w) & (X_r > 0.1) & (X_r < 4.0)
 
-        # Keep the closest obstacle for each angle so Nav2 receives conservative ranges
-        scan_ranges = np.full(w, np.inf)
-        bins = ((alpha_obs - scan.angle_min) / scan.angle_increment).astype(int)
-        ok = (bins >= 0) & (bins < w)
-        np.minimum.at(scan_ranges, bins[ok], R_obs[ok])
-        scan.ranges = np.where(np.isinf(scan_ranges), np.nan, scan_ranges).tolist()
-        self.publisher_scan.publish(scan)
+        # Obstacles: points above grass height (OMNIMOW_SCAN_MIN_HEIGHT) and below the robot body
+        # (<= 45 cm). The closest one for each angle, so Nav2 receives conservative ranges
+        obstacle = in_view & (Z_r >= self.scan_min_height) & (Z_r <= 0.45)
+        obstacle_ranges = np.full(w, np.inf)
+        np.minimum.at(obstacle_ranges, bins[obstacle], R_r[obstacle])
+
+        # Free space: ground (below the obstacle band, not a hole) seen in a direction means nothing
+        # stands between the mower and the farthest ground point there. Nav2 clears its costmaps
+        # along these rays, e.g. where a dog was that has walked away; /scan and the AI mark again
+        # what is still there
+        ground = in_view & (Z_r > -0.10) & (Z_r < self.scan_min_height)
+        free_ranges = np.full(w, -np.inf)
+        np.maximum.at(free_ranges, bins[ground], R_r[ground])
+
+        for publisher, ranges in ((self.publisher_scan, obstacle_ranges),
+                                  (self.publisher_scan_free, free_ranges)):
+            scan = LaserScan()
+            scan.header.stamp = stamp
+            # The points are already transformed to base_link above (offset + pitch)
+            scan.header.frame_id = 'base_link'
+            scan.angle_min = angle_min
+            scan.angle_max = fov_rad / 2.0
+            scan.angle_increment = angle_increment
+            scan.time_increment = 0.0
+            scan.scan_time = self.timer.timer_period_ns * 1e-9
+            scan.range_min = 0.15
+            scan.range_max = 4.0
+            scan.ranges = np.where(np.isinf(ranges), np.nan, ranges).tolist()  # NaN: nothing at that angle
+            publisher.publish(scan)
 
 
 def main(args=None):

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # OmniMow AI model updater: installs the model attached to the newest GitHub release that has one.
+# The releases are those of OMNIMOW_MODEL_REPO, otherwise OMNIMOW_SOFTWARE_REPO, otherwise the GitHub
+# repository the mower was installed from (the clone's origin, like software updates).
 #
 # Runs from a systemd timer (omnimow-model-update.timer, set up by host_setup.sh) shortly after
 # boot and then every OMNIMOW_MODEL_CHECK_MIN minutes. When the newest release of
@@ -25,7 +27,20 @@ for env_file in /etc/omnimow/omnimow.env /etc/omnimow/robot.env /etc/omnimow/har
         set +a
     fi
 done
-REPO="${OMNIMOW_MODEL_REPO:-Ragsie/OmniMow}"
+# owner/name of the GitHub repository a clone was made from (its origin), or nothing. Read from the
+# clone's config file, so it also works as root on a clone owned by the user
+origin_repo() {
+    local url
+    url=$(git config --file "$1/.git/config" --get remote.origin.url 2>/dev/null) || return 0
+    url=${url%.git}
+    case "$url" in
+        *github.com[:/]*/*) echo "${url##*github.com[:/]}" ;;
+    esac
+}
+# The clone host_setup.sh ran from: /etc/omnimow/omnimow.env links to its system_setup folder
+REPO_DIR="$(dirname "$(dirname "$(readlink -f /etc/omnimow/omnimow.env)")")"
+REPO="${OMNIMOW_MODEL_REPO:-${OMNIMOW_SOFTWARE_REPO:-$(origin_repo "$REPO_DIR")}}"
+REPO="${REPO:-Ragsie/OmniMow}"
 ASSET="${OMNIMOW_MODEL_ASSET:-MowerAIn_seg_htp_context.bin}"
 MODEL_FILE="/opt/omnimow/models/$ASSET"
 VERSION_FILE=/opt/omnimow/models/model_version.json
@@ -34,15 +49,17 @@ TOKEN_FILE=/etc/omnimow/github_token
 auth=()
 [ -s "$TOKEN_FILE" ] && auth=(-H "Authorization: Bearer $(tr -d '[:space:]' < "$TOKEN_FILE")")
 
-releases=$(curl -fsSL --retry 3 "${auth[@]}" -H "Accept: application/vnd.github+json" \
-          "https://api.github.com/repos/$REPO/releases?per_page=50") || {
-    echo "Could not read the releases of $REPO (no network, or a private repository without $TOKEN_FILE)"
-    exit 1
-}
-
 # Newest published release with the model: tag, asset id/update time (also catches a model
-# replaced within the same release) and API URL. The list is sorted newest first.
-read -r tag asset_key asset_url < <(python3 -c '
+# replaced within the same release) and API URL. The list is sorted newest first. Software
+# releases often come without a model, so older pages are read until a release has one.
+tag=""
+for page in 1 2 3 4 5 6 7 8 9 10; do
+    releases=$(curl -fsSL --retry 3 "${auth[@]}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/releases?per_page=100&page=$page") || {
+        echo "Could not read the releases of $REPO (no network, or a private repository without $TOKEN_FILE)"
+        exit 1
+    }
+    read -r tag asset_key asset_url < <(python3 -c '
 import json, sys
 for release in json.load(sys.stdin):
     if release.get("draft") or release.get("prerelease"):
@@ -52,6 +69,10 @@ for release in json.load(sys.stdin):
             print(release["tag_name"], str(a["id"]) + "-" + a["updated_at"], a["url"])
             sys.exit(0)
 ' "$ASSET" <<< "$releases") || true
+    [ -n "${tag:-}" ] && break
+    # A page that is not full is the last one
+    [ "$(python3 -c 'import json, sys; print(len(json.load(sys.stdin)))' <<< "$releases")" -lt 100 ] && break
+done
 if [ -z "${tag:-}" ]; then
     echo "No release of $REPO has $ASSET attached"
     exit 1

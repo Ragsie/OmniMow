@@ -30,7 +30,8 @@ services:
   # micro-ROS agents: bridge the two ESP32s (serial) into ROS 2. Without them the ESP32
   # topics (/cmd_vel, /battery_state, /mower/heartbeat, /cutter/*) never reach ROS.
   # The baud rates must match MICROROS_BAUD / Serial.begin() in the ESP32 firmware.
-  # Test setup: only started with the ESP32s connected: docker compose --profile esp32 up -d
+  # Only started with the ESP32s connected (host_setup.sh adds the profile once both are there):
+  #   docker compose --profile esp32 up -d
   microros_drive:
     image: microros/micro-ros-agent:jazzy
     profiles: ["esp32"]
@@ -55,7 +56,7 @@ services:
       - ROS_DOMAIN_ID=1
     command: serial --dev /dev/ttyUSB_esp32_cutter -b 115200
 
-  # ROSbridge Websocket Service (API and mobile App communication) - port 8000
+  # rosbridge - port 8000 (the app does not use it; it talks to app_backend on 9000)
   rosbridge_websocket:
     build:
       context: ../rosbridge_websocket
@@ -79,7 +80,7 @@ services:
     privileged: true
     volumes:
       - /dev/shm:/dev/shm
-      - /opt/omnimow/models:/models                # MowerAIn_seg_htp_context.bin (deployed by the model training pipeline)
+      - /opt/omnimow/models:/models                # MowerAIn_seg_htp_context.bin, installed by update_model.sh from the GitHub releases
       - /opt/omnimow/incoming_raw:/incoming_raw    # Active learning images -> training server
       - /usr/lib/aarch64-linux-gnu:/host-lib:ro    # Host FastRPC library (libcdsprpc)
       - /lib/firmware:/lib/firmware:ro             # Hexagon DSP firmware blobs
@@ -191,6 +192,24 @@ services:
     environment:
       - ROS_DOMAIN_ID=1
 
+  # Live video for the app: left camera + AI detections over WebRTC - port 8889 (ws://<ip>:8889/webrtc)
+  video_stream:
+    build:
+      context: ../video_stream
+      dockerfile: Dockerfile
+    container_name: omnimow_video_stream
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    env_file:
+      - ./omnimow.env
+      - path: /etc/omnimow/robot.env  # this mower's own values (configure_robot.sh)
+        required: false
+      - path: /etc/omnimow/hardware.env  # found by host_setup.sh: platform, cameras, model
+        required: false
+    environment:
+      - ROS_DOMAIN_ID=1
+
   # Docking controller owns the Nav2 staging approach and final charging-contact detection.
   docking_control:
     build:
@@ -199,6 +218,8 @@ services:
     container_name: omnimow_docking_control
     restart: unless-stopped
     network_mode: host
+    volumes:
+      - /opt/omnimow:/opt/omnimow  # dock.json: where the dock is on the map (saved by the mower itself)
     env_file:
       - ./omnimow.env
       - path: /etc/omnimow/robot.env  # this mower's own values (configure_robot.sh)
